@@ -24,6 +24,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 CONFIG=""
 GPU_TYPE="h100"
 DRY_RUN=false
+CPU_MODULE_TF="tensorflow-gpu/py3/2.16.1"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -45,6 +46,21 @@ if [[ ! -f "$CONFIG" ]]; then
 	exit 1
 fi
 
+ensure_launcher_python() {
+	if python3 -c "import numpy" >/dev/null 2>&1; then
+		return 0
+	fi
+	if command -v module >/dev/null 2>&1; then
+		module purge
+		module load "$CPU_MODULE_TF"
+		python3 -c "import numpy" >/dev/null 2>&1 && return 0
+	fi
+	echo "Unable to import numpy while loading config: activate an environment or load $CPU_MODULE_TF before running this script." >&2
+	exit 1
+}
+
+ensure_launcher_python
+
 # ---------------------------------------------------------------------------
 # Read key parameters from config using Python
 # ---------------------------------------------------------------------------
@@ -55,21 +71,20 @@ sys.path.insert(0, '$ROOT_DIR')
 from configs.load_config import load_experiment_config
 cfg = load_experiment_config('$CONFIG')
 $1
-"
+" || return 1
 }
 
-OUTPUT_BASE_DIR=$(read_config 'print(cfg.OUTPUT_BASE_DIR)')
-SLURM_ACCOUNT=$(read_config 'print(cfg.SLURM_CONFIG.get("account", "nab"))')
-SLURM_CPU_ACCOUNT=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; print(cfg.SLURM_CONFIG.get("cpu_account", f"{base}@cpu"))')
-SLURM_GPU_ACCOUNT_V100=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; common = cfg.SLURM_CONFIG.get("gpu_account", None); print(cfg.SLURM_CONFIG.get("v100_account", common if common is not None else f"{base}@v100"))')
-SLURM_GPU_ACCOUNT_H100=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; common = cfg.SLURM_CONFIG.get("gpu_account", None); print(cfg.SLURM_CONFIG.get("h100_account", common if common is not None else f"{base}@h100"))')
-SLURM_TIME=$(read_config 'print(cfg.SLURM_CONFIG.get("time_limit", "100:00:00"))')
-SLURM_CPUS=$(read_config 'print(cfg.SLURM_CONFIG.get("cpus_per_task", 24))')
-SLURM_EXCLUDE=$(read_config 'print(cfg.SLURM_CONFIG.get("exclude_nodes", ""))')
-DATASET_N_ARRAY=$(read_config 'print(cfg.SLURM_CONFIG.get("dataset_n_array_jobs", 10))')
-DATASET_CPUS=$(read_config 'print(cfg.SLURM_CONFIG.get("dataset_cpus_per_task", 40))')
-DATASET_TIME=$(read_config 'print(cfg.SLURM_CONFIG.get("dataset_time_limit", "10:00:00"))')
-CPU_MODULE_TF="tensorflow-gpu/py3/2.16.1"
+OUTPUT_BASE_DIR=$(read_config 'print(cfg.OUTPUT_BASE_DIR)') || exit 1
+SLURM_ACCOUNT=$(read_config 'print(cfg.SLURM_CONFIG.get("account", "nab"))') || exit 1
+SLURM_CPU_ACCOUNT=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; print(cfg.SLURM_CONFIG.get("cpu_account", f"{base}@cpu"))') || exit 1
+SLURM_GPU_ACCOUNT_V100=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; common = cfg.SLURM_CONFIG.get("gpu_account", None); print(cfg.SLURM_CONFIG.get("v100_account", common if common is not None else f"{base}@v100"))') || exit 1
+SLURM_GPU_ACCOUNT_H100=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; common = cfg.SLURM_CONFIG.get("gpu_account", None); print(cfg.SLURM_CONFIG.get("h100_account", common if common is not None else f"{base}@h100"))') || exit 1
+SLURM_TIME=$(read_config 'print(cfg.SLURM_CONFIG.get("time_limit", "100:00:00"))') || exit 1
+SLURM_CPUS=$(read_config 'print(cfg.SLURM_CONFIG.get("cpus_per_task", 24))') || exit 1
+SLURM_EXCLUDE=$(read_config 'print(cfg.SLURM_CONFIG.get("exclude_nodes", ""))') || exit 1
+DATASET_N_ARRAY=$(read_config 'print(cfg.SLURM_CONFIG.get("dataset_n_array_jobs", 10))') || exit 1
+DATASET_CPUS=$(read_config 'print(cfg.SLURM_CONFIG.get("dataset_cpus_per_task", 40))') || exit 1
+DATASET_TIME=$(read_config 'print(cfg.SLURM_CONFIG.get("dataset_time_limit", "10:00:00"))') || exit 1
 
 # GPU-type specific SLURM settings
 case "$GPU_TYPE" in
