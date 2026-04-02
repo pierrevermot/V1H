@@ -947,6 +947,8 @@ def main() -> None:
 		dataset_config["data_dir"],
 		batch_size=dataset_config["batch_size"],
 		val_batch_size=int(dataset_config.get("val_batch_size", dataset_config["batch_size"])),
+		val_shuffle=False,
+		val_repeat=False,
 		shuffle=dataset_config["shuffle"],
 		repeat=dataset_config["repeat"],
 		seed=dataset_config["seed"],
@@ -1069,7 +1071,13 @@ def main() -> None:
 		)
 	)
 	callbacks.append(_ValidationLossPrinter(metric_names=[m.name for m in model.metrics if m.name != "loss"], val_dataset=val_ds, verbose=verbose))
-	callbacks.append(_SaveBestExamples(val_dataset=val_ds, save_dir=checkpoint_path.parent / "best_examples"))
+	callbacks.append(
+		_SaveBestExamples(
+			val_dataset=val_ds,
+			save_dir=checkpoint_path.parent / "best_examples",
+			target_layout="joint",
+		)
+	)
 
 	batch_history = _BatchHistory(metric_names=[m.name for m in model.metrics if m.name != "loss"])
 	callbacks.append(batch_history)

@@ -162,22 +162,52 @@ module load $CPU_MODULE_TF
 export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
 cd "$ROOT_DIR"
 
-TOTAL_BATCHES=\$(python3 -c "
+TOTAL_TRAIN_BATCHES=\$(python3 -c "
 import sys; sys.path.insert(0, '$ROOT_DIR')
 from configs.load_config import load_experiment_config
 cfg = load_experiment_config('$CONFIG')
 print(cfg.DATASET_GEN_CONFIG.get('n_batches', 1024))
 ")
 
-BATCHES_PER_JOB=\$(( (TOTAL_BATCHES + $DATASET_N_ARRAY - 1) / $DATASET_N_ARRAY ))
-BATCH_OFFSET=\$(( SLURM_ARRAY_TASK_ID * BATCHES_PER_JOB ))
+TOTAL_VAL_BATCHES=\$(python3 -c "
+import sys; sys.path.insert(0, '$ROOT_DIR')
+from configs.load_config import load_experiment_config
+cfg = load_experiment_config('$CONFIG')
+train_batches = int(cfg.DATASET_GEN_CONFIG.get('n_batches', 1024))
+print(cfg.DATASET_GEN_CONFIG.get('val_n_batches', max(train_batches // 16, 1)))
+")
 
-python3 -u workflow/create_dataset.py \\
-	--config "$CONFIG" \\
-	--n-batches "\$BATCHES_PER_JOB" \\
-	--batch-offset "\$BATCH_OFFSET" \\
-	--n-workers "$DATASET_CPUS" \\
-	--parallel-mode joblib
+BATCHES_PER_JOB=\$(( (TOTAL_TRAIN_BATCHES + $DATASET_N_ARRAY - 1) / $DATASET_N_ARRAY ))
+BATCH_OFFSET=\$(( SLURM_ARRAY_TASK_ID * BATCHES_PER_JOB ))
+REMAINING_BATCHES=\$(( TOTAL_TRAIN_BATCHES - BATCH_OFFSET ))
+
+if (( REMAINING_BATCHES > 0 )); then
+	if (( REMAINING_BATCHES < BATCHES_PER_JOB )); then
+		BATCHES_THIS_JOB=\$REMAINING_BATCHES
+	else
+		BATCHES_THIS_JOB=\$BATCHES_PER_JOB
+	fi
+
+	python3 -u workflow/create_dataset.py \\
+		--config "$CONFIG" \\
+		--split train \\
+		--n-batches "\$BATCHES_THIS_JOB" \\
+		--batch-offset "\$BATCH_OFFSET" \\
+		--n-workers "$DATASET_CPUS" \\
+		--parallel-mode joblib
+else
+	echo "No training shards assigned to array task \$SLURM_ARRAY_TASK_ID"
+fi
+
+if [[ "\$SLURM_ARRAY_TASK_ID" -eq 0 ]]; then
+	python3 -u workflow/create_dataset.py \\
+		--config "$CONFIG" \\
+		--split val \\
+		--val-n-batches "\$TOTAL_VAL_BATCHES" \\
+		--val-batch-offset 0 \\
+		--n-workers "$DATASET_CPUS" \\
+		--parallel-mode joblib
+fi
 SLURM_EOF
 chmod +x "$STEP1_SCRIPT"
 JOB1=$(submit_job "$STEP1_SCRIPT")

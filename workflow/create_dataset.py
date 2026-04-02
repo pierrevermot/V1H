@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 import threading
 import queue as queue_mod
+import traceback
 
 import numpy as np
 import tensorflow as tf
@@ -39,6 +40,8 @@ from noises.random_noise_parameters import draw_random_noise_parameters
 
 VLT_PRIMARY_DIAMETER_M = 8.0
 VLT_CENTRAL_OBSCURATION_DIAMETER_M = 1.116
+_QUEUE_DONE = object()
+_WORKER_ERROR_TAG = "__worker_error__"
 
 
 def _prepare_random_phase_kwargs(random_phase_config: dict, n_frames: int) -> dict[str, object]:
@@ -168,28 +171,37 @@ def _write_batch(
 			writer.write(serialize_example(image, obs, psf, noise, ref_psf))
 
 
-def _worker_generate(queue, n_examples: int, seed: int, ao_instru, ref_ao_instru,
+def _worker_generate(queue, n_examples: int, seed: int, stop_event, ao_instru, ref_ao_instru,
                      random_phase_config, random_sky_config, random_noise_config):
 	"""Worker: generate examples and put serialized bytes into queue."""
-	if seed is not None:
-		np.random.seed(seed)
-		rng = np.random.default_rng(seed)
-	else:
-		rng = None
-	for _ in range(n_examples):
-		image, obs, psf, noise, ref_psf = get_example(
-			ao_instru, ref_ao_instru, rng=rng,
-			random_phase_config=random_phase_config,
-			random_sky_config=random_sky_config,
-			random_noise_config=random_noise_config,
-		)
-		image = to_numpy(image)
-		obs = to_numpy(obs)
-		psf = to_numpy(psf)
-		noise = to_numpy(noise)
-		ref_psf = to_numpy(ref_psf)
-		queue.put(serialize_example(image, obs, psf, noise, ref_psf))
-	queue.put(None)
+	try:
+		if seed is not None:
+			np.random.seed(seed)
+			rng = np.random.default_rng(seed)
+		else:
+			rng = None
+		for _ in range(n_examples):
+			if stop_event.is_set():
+				break
+			image, obs, psf, noise, ref_psf = get_example(
+				ao_instru, ref_ao_instru, rng=rng,
+				random_phase_config=random_phase_config,
+				random_sky_config=random_sky_config,
+				random_noise_config=random_noise_config,
+			)
+			image = to_numpy(image)
+			obs = to_numpy(obs)
+			psf = to_numpy(psf)
+			noise = to_numpy(noise)
+			ref_psf = to_numpy(ref_psf)
+			if stop_event.is_set():
+				break
+			queue.put(serialize_example(image, obs, psf, noise, ref_psf))
+	except Exception:
+		stop_event.set()
+		queue.put((_WORKER_ERROR_TAG, traceback.format_exc()))
+	finally:
+		queue.put(_QUEUE_DONE)
 
 
 def _write_batch_queue(
@@ -210,6 +222,7 @@ def _write_batch_queue(
 	if file_path.exists():
 		return
 	queue = queue_mod.Queue(maxsize=256)
+	stop_event = threading.Event()
 	seeds = np.random.SeedSequence(seed).spawn(n_workers)
 	worker_seeds = [int(s.generate_state(1, dtype=np.uint32)[0]) for s in seeds]
 
@@ -224,7 +237,7 @@ def _write_batch_queue(
 			continue
 		t = threading.Thread(
 			target=_worker_generate,
-			args=(queue, counts[i], worker_seeds[i], ao_instru, ref_ao_instru,
+			args=(queue, counts[i], worker_seeds[i], stop_event, ao_instru, ref_ao_instru,
 			      random_phase_config, random_sky_config, random_noise_config),
 			daemon=True,
 		)
@@ -233,16 +246,28 @@ def _write_batch_queue(
 
 	# Writer loop
 	finished = 0
-	with tf.io.TFRecordWriter(str(file_path)) as writer:
-		while finished < len(threads):
-			item = queue.get()
-			if item is None:
-				finished += 1
-				continue
-			writer.write(item)
-
-	for t in threads:
-		t.join()
+	worker_error = None
+	try:
+		with tf.io.TFRecordWriter(str(file_path)) as writer:
+			while finished < len(threads):
+				item = queue.get()
+				if item is _QUEUE_DONE:
+					finished += 1
+					continue
+				if isinstance(item, tuple) and item and item[0] == _WORKER_ERROR_TAG:
+					stop_event.set()
+					if worker_error is None:
+						worker_error = RuntimeError(f"Queue-mode dataset generation failed for batch {batch_idx}:\n{item[1]}")
+					continue
+				if worker_error is None:
+					writer.write(item)
+	finally:
+		stop_event.set()
+		for t in threads:
+			t.join()
+	if worker_error is not None:
+		file_path.unlink(missing_ok=True)
+		raise worker_error
 
 
 def write_dataset(
@@ -346,10 +371,16 @@ def main() -> None:
 		help="Number of worker processes when parallel",
 	)
 	parser.add_argument("--output-dir", default=None, help="Root dataset output directory")
+	parser.add_argument(
+		"--split",
+		choices=("both", "train", "val"),
+		default="both",
+		help="Dataset split(s) to generate",
+	)
 	parser.add_argument("--n-batches", type=int, default=None, help="Number of batches for this shard")
 	parser.add_argument("--batch-offset", type=int, default=0, help="Batch index offset for this shard")
 	parser.add_argument("--val-n-batches", type=int, default=None, help="Number of validation batches")
-	parser.add_argument("--val-batch-offset", type=int, default=0, help="Validation batch index offset")
+	parser.add_argument("--val-batch-offset", type=int, default=None, help="Validation batch index offset")
 	parser.add_argument("--seed-base", type=int, default=None, help="Base seed for deterministic shards")
 	args = parser.parse_args()
 
@@ -363,11 +394,22 @@ def main() -> None:
 	default_output_dir = ds_gen.get("output_dir", "/tmp/dataset")
 	default_n_batches = ds_gen.get("n_batches", 1)
 	default_n_ex_per_batch = ds_gen.get("n_ex_per_batch", 100)
+	default_val_n_batches = ds_gen.get("val_n_batches", max(default_n_batches // 16, 1))
 	default_seed = ds_gen.get("seed", 1234)
 
 	output_dir = args.output_dir or default_output_dir
 	n_batches = args.n_batches if args.n_batches is not None else default_n_batches
-	val_n_batches = args.val_n_batches if args.val_n_batches is not None else max(n_batches // 16, 1)
+	if args.val_n_batches is not None:
+		val_n_batches = args.val_n_batches
+	elif args.split == "val" and args.n_batches is not None:
+		val_n_batches = args.n_batches
+	else:
+		val_n_batches = default_val_n_batches
+	val_batch_offset = (
+		args.val_batch_offset
+		if args.val_batch_offset is not None
+		else args.batch_offset if args.split == "val" else 0
+	)
 	seed_base = args.seed_base if args.seed_base is not None else default_seed
 
 	output_root = Path(output_dir)
@@ -394,36 +436,38 @@ def main() -> None:
 	parallel_mode = args.parallel_mode if parallel else "none"
 	n_workers = int(args.n_workers)
 
-	write_dataset(
-		ao_instru,
-		ref_ao_instru,
-		train_dir,
-		int(n_batches),
-		default_n_ex_per_batch,
-		parallel=parallel,
-		parallel_mode=parallel_mode,
-		n_workers=n_workers,
-		batch_offset=int(args.batch_offset),
-		seed_base=seed_base,
-		random_phase_config=random_phase_config,
-		random_sky_config=random_sky_config,
-		random_noise_config=random_noise_config,
-	)
-	write_dataset(
-		ao_instru,
-		ref_ao_instru,
-		val_dir,
-		int(val_n_batches),
-		default_n_ex_per_batch,
-		parallel=parallel,
-		parallel_mode=parallel_mode,
-		n_workers=n_workers,
-		batch_offset=int(args.val_batch_offset),
-		seed_base=seed_base + 10_000 if seed_base is not None else None,
-		random_phase_config=random_phase_config,
-		random_sky_config=random_sky_config,
-		random_noise_config=random_noise_config,
-	)
+	if args.split in ("both", "train"):
+		write_dataset(
+			ao_instru,
+			ref_ao_instru,
+			train_dir,
+			int(n_batches),
+			default_n_ex_per_batch,
+			parallel=parallel,
+			parallel_mode=parallel_mode,
+			n_workers=n_workers,
+			batch_offset=int(args.batch_offset),
+			seed_base=seed_base,
+			random_phase_config=random_phase_config,
+			random_sky_config=random_sky_config,
+			random_noise_config=random_noise_config,
+		)
+	if args.split in ("both", "val"):
+		write_dataset(
+			ao_instru,
+			ref_ao_instru,
+			val_dir,
+			int(val_n_batches),
+			default_n_ex_per_batch,
+			parallel=parallel,
+			parallel_mode=parallel_mode,
+			n_workers=n_workers,
+			batch_offset=int(val_batch_offset),
+			seed_base=seed_base + 10_000 if seed_base is not None else None,
+			random_phase_config=random_phase_config,
+			random_sky_config=random_sky_config,
+			random_noise_config=random_noise_config,
+		)
 
 
 if __name__ == "__main__":

@@ -108,6 +108,8 @@ def _run_training(
 		dataset_config["data_dir"],
 		batch_size=dataset_config["batch_size"],
 		val_batch_size=int(dataset_config.get("val_batch_size", dataset_config["batch_size"])),
+		val_shuffle=False,
+		val_repeat=False,
 		shuffle=dataset_config["shuffle"],
 		repeat=dataset_config["repeat"],
 		seed=dataset_config["seed"],
@@ -173,6 +175,7 @@ def _run_training(
 		train_ds,
 		val_dataset=val_ds,
 		use_pinn=False,
+		best_examples_target_layout=head_target,
 		**train_cfg,
 	)
 

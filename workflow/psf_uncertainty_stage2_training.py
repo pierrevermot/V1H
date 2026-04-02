@@ -756,6 +756,7 @@ def main() -> None:
 		train_ds,
 		val_dataset=val_ds,
 		use_pinn=False,
+		best_examples_target_layout="stage2_psf_uncertainty",
 		**train_cfg,
 	)
 

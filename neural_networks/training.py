@@ -49,12 +49,46 @@ class _SaveBestExamples(tf.keras.callbacks.Callback):
 		val_dataset: tf.data.Dataset,
 		save_dir: Path,
 		n_examples: int = 100,
+		target_layout: str = "generic",
 	):
 		super().__init__()
 		self.val_dataset = val_dataset
 		self.save_dir = save_dir
 		self.n_examples = int(n_examples)
+		self.target_layout = str(target_layout).strip().lower()
 		self.best = None
+
+	def _split_targets(self, y_true: np.ndarray) -> dict[str, np.ndarray]:
+		if self.target_layout in {"generic", "target"}:
+			return {"target": y_true}
+		if self.target_layout in {"im", "image"}:
+			return {"image": y_true}
+		if self.target_layout == "psf":
+			return {"psf": y_true}
+		if self.target_layout == "noise":
+			return {"noise": y_true}
+		if self.target_layout == "joint":
+			if y_true.shape[-1] < 3 or (y_true.shape[-1] - 1) % 2 != 0:
+				raise ValueError(
+					f"Expected joint target layout [image, psf..., noise...], got shape {y_true.shape}"
+				)
+			n_frames = (y_true.shape[-1] - 1) // 2
+			return {
+				"image": y_true[..., :1],
+				"psf": y_true[..., 1 : 1 + n_frames],
+				"noise": y_true[..., 1 + n_frames : 1 + 2 * n_frames],
+			}
+		if self.target_layout == "stage2_psf_uncertainty":
+			if y_true.shape[-1] % 2 != 0:
+				raise ValueError(
+					f"Expected stage-2 target layout [true_psf, fixed_mean_psf], got shape {y_true.shape}"
+				)
+			n_frames = y_true.shape[-1] // 2
+			return {
+				"psf": y_true[..., :n_frames],
+				"fixed_mean_psf": y_true[..., n_frames:],
+			}
+		raise ValueError(f"Unknown best-example target layout: {self.target_layout!r}")
 
 	def on_epoch_end(self, epoch, logs=None):
 		if not logs or "val_loss" not in logs:
@@ -68,9 +102,8 @@ class _SaveBestExamples(tf.keras.callbacks.Callback):
 
 	def _save_examples(self):
 		obs_list = []
-		image_list = []
-		psf_list = []
-		noise_list = []
+		target_list = []
+		named_target_lists: dict[str, list[np.ndarray]] = {}
 		pred_list = []
 		count = 0
 
@@ -83,16 +116,12 @@ class _SaveBestExamples(tf.keras.callbacks.Callback):
 				obs = obs_batch[i].numpy()
 				y_true = y_true_batch[i].numpy()
 				pred = pred_batch[i]
-
-				image = y_true[..., :1]
-				n_frames = (y_true.shape[-1] - 1) // 2
-				psf = y_true[..., 1 : 1 + n_frames]
-				noise = y_true[..., 1 + n_frames : 1 + 2 * n_frames]
+				named_targets = self._split_targets(y_true)
 
 				obs_list.append(obs)
-				image_list.append(image)
-				psf_list.append(psf)
-				noise_list.append(noise)
+				target_list.append(y_true)
+				for name, value in named_targets.items():
+					named_target_lists.setdefault(name, []).append(value)
 				pred_list.append(pred)
 				count += 1
 			if count >= self.n_examples:
@@ -100,9 +129,11 @@ class _SaveBestExamples(tf.keras.callbacks.Callback):
 
 		self.save_dir.mkdir(parents=True, exist_ok=True)
 		np.save(self.save_dir / "examples_obs.npy", np.asarray(obs_list))
-		np.save(self.save_dir / "examples_image.npy", np.asarray(image_list))
-		np.save(self.save_dir / "examples_psf.npy", np.asarray(psf_list))
-		np.save(self.save_dir / "examples_noise.npy", np.asarray(noise_list))
+		np.save(self.save_dir / "examples_target.npy", np.asarray(target_list))
+		for name, values in named_target_lists.items():
+			if name == "target":
+				continue
+			np.save(self.save_dir / f"examples_{name}.npy", np.asarray(values))
 		np.save(self.save_dir / "examples_pred.npy", np.asarray(pred_list))
 
 
@@ -156,6 +187,7 @@ def train_unet(
 	checkpoint_path: str | Path = "checkpoints/unet_best.keras",
 	subloss_fn=None,
 	extra_callbacks: list[tf.keras.callbacks.Callback] | None = None,
+	best_examples_target_layout: str = "generic",
 ) -> dict[str, object]:
 	"""Train a U-Net model.
 
@@ -238,7 +270,13 @@ def train_unet(
 	callbacks.append(_LossPrinter(metric_names=metric_names, verbose=verbose))
 	if val_dataset is not None:
 		save_dir = Path(checkpoint_path).parent / "best_examples"
-		callbacks.append(_SaveBestExamples(val_dataset=val_dataset, save_dir=save_dir))
+		callbacks.append(
+			_SaveBestExamples(
+				val_dataset=val_dataset,
+				save_dir=save_dir,
+				target_layout=best_examples_target_layout,
+			)
+		)
 
 	batch_history = _BatchHistory(metric_names=metric_names)
 	callbacks.append(batch_history)

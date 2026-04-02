@@ -42,7 +42,9 @@ _DEFAULT_ARCH: dict[str, object] = {
 
 def _infer_independent_head_target(head_dir: Path, head_cfg: dict[str, Any]) -> str:
 	head_target = str(head_cfg.get("head_target", "")).strip().lower()
-	if head_target in {"im", "psf", "res"}:
+	if head_target in {"im", "psf", "noise", "res"}:
+		if head_target == "res":
+			return "noise"
 		return head_target
 	dir_name = head_dir.name.strip().lower()
 	if dir_name in {"image_only", "im", "image"}:
@@ -50,7 +52,7 @@ def _infer_independent_head_target(head_dir: Path, head_cfg: dict[str, Any]) -> 
 	if dir_name in {"psf_only", "psf"}:
 		return "psf"
 	if dir_name in {"noise_only", "noise", "residuals_only", "res", "residual"}:
-		return "res"
+		return "noise"
 	raise ValueError(f"Could not infer head target for {head_dir}")
 
 

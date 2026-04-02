@@ -220,6 +220,8 @@ def make_train_val_datasets(
 	train_subdir: str = "train",
 	val_subdir: str = "val",
 	val_batch_size: int | None = None,
+	val_shuffle: bool | None = None,
+	val_repeat: bool | None = None,
 	**dataset_kwargs,
 ) -> tuple[tf.data.Dataset, tf.data.Dataset]:
 	"""Create train/val datasets from a root directory."""
@@ -228,5 +230,9 @@ def make_train_val_datasets(
 	val_kwargs = dict(dataset_kwargs)
 	if val_batch_size is not None:
 		val_kwargs["batch_size"] = int(val_batch_size)
+	if val_shuffle is not None:
+		val_kwargs["shuffle"] = bool(val_shuffle)
+	if val_repeat is not None:
+		val_kwargs["repeat"] = bool(val_repeat)
 	val_ds = make_dataset(root / val_subdir, **val_kwargs)
 	return train_ds, val_ds
