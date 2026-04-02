@@ -15,8 +15,6 @@
 #   4. Joint PINN four-head fine-tuning    (GPU, depends on 2a+2b+3)
 #   5. Plot results                        (CPU, depends on 4)
 # ===========================================================================
-set -euo pipefail
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
@@ -144,7 +142,6 @@ cat > "$STEP1_SCRIPT" <<SLURM_EOF
 #SBATCH --hint=nomultithread
 $EXCLUDE_OPT
 
-set -euo pipefail
 module purge
 module load $CPU_MODULE_TF
 cd "$ROOT_DIR"
@@ -189,7 +186,6 @@ $GPU_CONSTRAINT
 #SBATCH --dependency=afterok:$JOB1
 $EXCLUDE_OPT
 
-set -euo pipefail
 module purge
 $ARCH_PREMODULE
 module load $MODULE_TF
@@ -221,7 +217,6 @@ $GPU_CONSTRAINT
 #SBATCH --dependency=afterok:$JOB1
 $EXCLUDE_OPT
 
-set -euo pipefail
 module purge
 $ARCH_PREMODULE
 module load $MODULE_TF
@@ -253,7 +248,6 @@ $GPU_CONSTRAINT
 #SBATCH --dependency=afterok:$JOB1
 $EXCLUDE_OPT
 
-set -euo pipefail
 module purge
 $ARCH_PREMODULE
 module load $MODULE_TF
@@ -285,7 +279,6 @@ $GPU_CONSTRAINT
 #SBATCH --dependency=afterok:$JOB2C
 $EXCLUDE_OPT
 
-set -euo pipefail
 module purge
 $ARCH_PREMODULE
 module load $MODULE_TF
@@ -317,7 +310,6 @@ $GPU_CONSTRAINT
 #SBATCH --dependency=afterok:$JOB2A:$JOB2B:$JOB3
 $EXCLUDE_OPT
 
-set -euo pipefail
 module purge
 $ARCH_PREMODULE
 module load $MODULE_TF
@@ -346,7 +338,6 @@ cat > "$STEP5_SCRIPT" <<SLURM_EOF
 #SBATCH --dependency=afterok:$JOB4
 $EXCLUDE_OPT
 
-set -euo pipefail
 module purge
 module load $CPU_MODULE_TF
 cd "$ROOT_DIR"
