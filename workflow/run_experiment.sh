@@ -71,20 +71,16 @@ SLURM_EXCLUDE=$(read_config 'print(cfg.SLURM_CONFIG.get("exclude_nodes", ""))')
 DATASET_N_ARRAY=$(read_config 'print(cfg.SLURM_CONFIG.get("dataset_n_array_jobs", 10))')
 DATASET_CPUS=$(read_config 'print(cfg.SLURM_CONFIG.get("dataset_cpus_per_task", 40))')
 DATASET_TIME=$(read_config 'print(cfg.SLURM_CONFIG.get("dataset_time_limit", "10:00:00"))')
-SLURM_PARTITION_V100=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; print(cfg.SLURM_CONFIG.get("v100_partition", f"{base}@v100"))')
-SLURM_PARTITION_H100=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; print(cfg.SLURM_CONFIG.get("h100_partition", f"{base}@h100"))')
 
 # GPU-type specific SLURM settings
 case "$GPU_TYPE" in
 	v100)
 		SLURM_GPU_ACCOUNT="$SLURM_GPU_ACCOUNT_V100"
-		PARTITION="$SLURM_PARTITION_V100"
 		QOS="qos_gpu-t4"
 		MODULE_TF="tensorflow-gpu/py3/2.16.1"
 		;;
 	h100)
 		SLURM_GPU_ACCOUNT="$SLURM_GPU_ACCOUNT_H100"
-		PARTITION="$SLURM_PARTITION_H100"
 		QOS="qos_gpu_h100-t4"
 		MODULE_TF="tensorflow-gpu/py3/2.17.0"
 		;;
@@ -103,7 +99,6 @@ echo "Output base dir   : $OUTPUT_BASE_DIR"
 echo "CPU account       : $SLURM_CPU_ACCOUNT"
 echo "GPU account       : $SLURM_GPU_ACCOUNT"
 echo "GPU type          : $GPU_TYPE"
-echo "Partition         : $PARTITION"
 echo "QOS               : $QOS"
 echo "=========================================="
 
@@ -178,7 +173,6 @@ cat > "$STEP2A_SCRIPT" <<SLURM_EOF
 #SBATCH --output=$LOG_DIR/step2a_%j.out
 #SBATCH --error=$LOG_DIR/step2a_%j.err
 #SBATCH --account=$SLURM_GPU_ACCOUNT
-#SBATCH --partition=$PARTITION
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=$SLURM_CPUS
@@ -209,7 +203,6 @@ cat > "$STEP2B_SCRIPT" <<SLURM_EOF
 #SBATCH --output=$LOG_DIR/step2b_%j.out
 #SBATCH --error=$LOG_DIR/step2b_%j.err
 #SBATCH --account=$SLURM_GPU_ACCOUNT
-#SBATCH --partition=$PARTITION
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=$SLURM_CPUS
@@ -240,7 +233,6 @@ cat > "$STEP2C_SCRIPT" <<SLURM_EOF
 #SBATCH --output=$LOG_DIR/step2c_%j.out
 #SBATCH --error=$LOG_DIR/step2c_%j.err
 #SBATCH --account=$SLURM_GPU_ACCOUNT
-#SBATCH --partition=$PARTITION
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=$SLURM_CPUS
@@ -271,7 +263,6 @@ cat > "$STEP3_SCRIPT" <<SLURM_EOF
 #SBATCH --output=$LOG_DIR/step3_%j.out
 #SBATCH --error=$LOG_DIR/step3_%j.err
 #SBATCH --account=$SLURM_GPU_ACCOUNT
-#SBATCH --partition=$PARTITION
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=$SLURM_CPUS
@@ -302,7 +293,6 @@ cat > "$STEP4_SCRIPT" <<SLURM_EOF
 #SBATCH --output=$LOG_DIR/step4_%j.out
 #SBATCH --error=$LOG_DIR/step4_%j.err
 #SBATCH --account=$SLURM_GPU_ACCOUNT
-#SBATCH --partition=$PARTITION
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=$SLURM_CPUS
