@@ -77,11 +77,15 @@ case "$GPU_TYPE" in
 	v100)
 		SLURM_GPU_ACCOUNT="$SLURM_GPU_ACCOUNT_V100"
 		QOS="qos_gpu-t4"
+		GPU_CONSTRAINT=""
+		ARCH_PREMODULE=""
 		MODULE_TF="tensorflow-gpu/py3/2.16.1"
 		;;
 	h100)
 		SLURM_GPU_ACCOUNT="$SLURM_GPU_ACCOUNT_H100"
 		QOS="qos_gpu_h100-t4"
+		GPU_CONSTRAINT="#SBATCH -C h100"
+		ARCH_PREMODULE="module load arch/h100"
 		MODULE_TF="tensorflow-gpu/py3/2.17.0"
 		;;
 	*)
@@ -178,11 +182,13 @@ cat > "$STEP2A_SCRIPT" <<SLURM_EOF
 #SBATCH --cpus-per-task=$SLURM_CPUS
 #SBATCH --time=$SLURM_TIME
 #SBATCH --hint=nomultithread
+$GPU_CONSTRAINT
 #SBATCH --dependency=afterok:$JOB1
 $EXCLUDE_OPT
 
 set -euo pipefail
 module purge
+$ARCH_PREMODULE
 module load $MODULE_TF
 cd "$ROOT_DIR"
 
@@ -208,11 +214,13 @@ cat > "$STEP2B_SCRIPT" <<SLURM_EOF
 #SBATCH --cpus-per-task=$SLURM_CPUS
 #SBATCH --time=$SLURM_TIME
 #SBATCH --hint=nomultithread
+$GPU_CONSTRAINT
 #SBATCH --dependency=afterok:$JOB1
 $EXCLUDE_OPT
 
 set -euo pipefail
 module purge
+$ARCH_PREMODULE
 module load $MODULE_TF
 cd "$ROOT_DIR"
 
@@ -238,11 +246,13 @@ cat > "$STEP2C_SCRIPT" <<SLURM_EOF
 #SBATCH --cpus-per-task=$SLURM_CPUS
 #SBATCH --time=$SLURM_TIME
 #SBATCH --hint=nomultithread
+$GPU_CONSTRAINT
 #SBATCH --dependency=afterok:$JOB1
 $EXCLUDE_OPT
 
 set -euo pipefail
 module purge
+$ARCH_PREMODULE
 module load $MODULE_TF
 cd "$ROOT_DIR"
 
@@ -268,11 +278,13 @@ cat > "$STEP3_SCRIPT" <<SLURM_EOF
 #SBATCH --cpus-per-task=$SLURM_CPUS
 #SBATCH --time=$SLURM_TIME
 #SBATCH --hint=nomultithread
+$GPU_CONSTRAINT
 #SBATCH --dependency=afterok:$JOB2C
 $EXCLUDE_OPT
 
 set -euo pipefail
 module purge
+$ARCH_PREMODULE
 module load $MODULE_TF
 cd "$ROOT_DIR"
 
@@ -298,11 +310,13 @@ cat > "$STEP4_SCRIPT" <<SLURM_EOF
 #SBATCH --cpus-per-task=$SLURM_CPUS
 #SBATCH --time=$SLURM_TIME
 #SBATCH --hint=nomultithread
+$GPU_CONSTRAINT
 #SBATCH --dependency=afterok:$JOB2A:$JOB2B:$JOB3
 $EXCLUDE_OPT
 
 set -euo pipefail
 module purge
+$ARCH_PREMODULE
 module load $MODULE_TF
 cd "$ROOT_DIR"
 
