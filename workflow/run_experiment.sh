@@ -71,6 +71,7 @@ SLURM_EXCLUDE=$(read_config 'print(cfg.SLURM_CONFIG.get("exclude_nodes", ""))')
 DATASET_N_ARRAY=$(read_config 'print(cfg.SLURM_CONFIG.get("dataset_n_array_jobs", 10))')
 DATASET_CPUS=$(read_config 'print(cfg.SLURM_CONFIG.get("dataset_cpus_per_task", 40))')
 DATASET_TIME=$(read_config 'print(cfg.SLURM_CONFIG.get("dataset_time_limit", "10:00:00"))')
+CPU_MODULE_TF="tensorflow-gpu/py3/2.16.1"
 
 # GPU-type specific SLURM settings
 case "$GPU_TYPE" in
@@ -144,6 +145,8 @@ cat > "$STEP1_SCRIPT" <<SLURM_EOF
 $EXCLUDE_OPT
 
 set -euo pipefail
+module purge
+module load $CPU_MODULE_TF
 cd "$ROOT_DIR"
 
 TOTAL_BATCHES=\$(python3 -c "
@@ -345,7 +348,7 @@ $EXCLUDE_OPT
 
 set -euo pipefail
 module purge
-module load $MODULE_TF
+module load $CPU_MODULE_TF
 cd "$ROOT_DIR"
 
 JOINT_RUN_NAME=\$(python3 -c "
