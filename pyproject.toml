@@ -6,7 +6,9 @@ build-backend = "setuptools.backends._legacy:_Backend"
 name = "v1h"
 version = "0.1.0"
 description = "Physics-informed neural network for adaptive-optics image deconvolution"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MPL-2.0" }
 dependencies = [
     "numpy",
     "scipy",
@@ -15,6 +17,9 @@ dependencies = [
     "hcipy",
     "astropy",
     "joblib",
+]
+classifiers = [
+    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
 ]
 
 [project.optional-dependencies]
