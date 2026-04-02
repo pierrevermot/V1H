@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 from typing import Any
 
 import matplotlib
@@ -18,6 +19,10 @@ matplotlib.use("Agg")
 from matplotlib.colors import Normalize
 import numpy as np
 import tensorflow as tf
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+	sys.path.insert(0, str(ROOT_DIR))
 
 from utils.convolution import (
 	_convolve_image_with_psf_cube,

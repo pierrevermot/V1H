@@ -12,12 +12,12 @@ import queue as queue_mod
 import numpy as np
 import tensorflow as tf
 
-from utils.convolution import _convolve_image_with_psfs_numpy as _convolve_image_with_psfs
-from utils.tfrecord_io import _bytes_feature, _int64_feature, serialize_example
-
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
 	sys.path.insert(0, str(ROOT_DIR))
+
+from utils.convolution import _convolve_image_with_psfs_numpy as _convolve_image_with_psfs
+from utils.tfrecord_io import _bytes_feature, _int64_feature, serialize_example
 
 # Route CuPy cache to $SCRATCH when available
 _scratch = os.environ.get("SCRATCH")

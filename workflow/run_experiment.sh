@@ -144,6 +144,7 @@ $EXCLUDE_OPT
 
 module purge
 module load $CPU_MODULE_TF
+export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
 cd "$ROOT_DIR"
 
 TOTAL_BATCHES=\$(python3 -c "
@@ -189,6 +190,7 @@ $EXCLUDE_OPT
 module purge
 $ARCH_PREMODULE
 module load $MODULE_TF
+export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
 cd "$ROOT_DIR"
 
 python3 -u workflow/independent_training.py \\
@@ -220,6 +222,7 @@ $EXCLUDE_OPT
 module purge
 $ARCH_PREMODULE
 module load $MODULE_TF
+export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
 cd "$ROOT_DIR"
 
 python3 -u workflow/independent_training.py \\
@@ -251,6 +254,7 @@ $EXCLUDE_OPT
 module purge
 $ARCH_PREMODULE
 module load $MODULE_TF
+export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
 cd "$ROOT_DIR"
 
 python3 -u workflow/independent_training.py \\
@@ -282,6 +286,7 @@ $EXCLUDE_OPT
 module purge
 $ARCH_PREMODULE
 module load $MODULE_TF
+export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
 cd "$ROOT_DIR"
 
 python3 -u workflow/psf_uncertainty_stage2_training.py \\
@@ -313,6 +318,7 @@ $EXCLUDE_OPT
 module purge
 $ARCH_PREMODULE
 module load $MODULE_TF
+export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
 cd "$ROOT_DIR"
 
 python3 -u workflow/joint_pinn_fourhead_training.py \\
@@ -340,6 +346,7 @@ $EXCLUDE_OPT
 
 module purge
 module load $CPU_MODULE_TF
+export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
 cd "$ROOT_DIR"
 
 JOINT_RUN_NAME=\$(python3 -c "
