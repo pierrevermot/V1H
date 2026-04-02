@@ -336,6 +336,8 @@ JOINT_PINN_CONFIG: dict[str, object] = {
 SLURM_CONFIG: dict[str, object] = {
 	"gpu_type": "h100",
 	"account": "nab",
+	"cpu_account": "nab@cpu",
+	"gpu_account": "nab",
 	"time_limit": "100:00:00",
 	"cpus_per_task": 24,
 	"exclude_nodes": "",
@@ -343,5 +345,7 @@ SLURM_CONFIG: dict[str, object] = {
 	"dataset_n_array_jobs": 10,
 	"dataset_cpus_per_task": 40,
 	"dataset_time_limit": "10:00:00",
-	# Overrides per GPU type (populated automatically by orchestrator)
+	# Optional partition overrides per GPU type
+	"v100_partition": "nab@v100",
+	"h100_partition": "nab@h100",
 }

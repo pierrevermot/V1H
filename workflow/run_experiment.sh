@@ -62,22 +62,26 @@ $1
 
 OUTPUT_BASE_DIR=$(read_config 'print(cfg.OUTPUT_BASE_DIR)')
 SLURM_ACCOUNT=$(read_config 'print(cfg.SLURM_CONFIG.get("account", "nab"))')
+SLURM_CPU_ACCOUNT=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; print(cfg.SLURM_CONFIG.get("cpu_account", f"{base}@cpu"))')
+SLURM_GPU_ACCOUNT=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; print(cfg.SLURM_CONFIG.get("gpu_account", base))')
 SLURM_TIME=$(read_config 'print(cfg.SLURM_CONFIG.get("time_limit", "100:00:00"))')
 SLURM_CPUS=$(read_config 'print(cfg.SLURM_CONFIG.get("cpus_per_task", 24))')
 SLURM_EXCLUDE=$(read_config 'print(cfg.SLURM_CONFIG.get("exclude_nodes", ""))')
 DATASET_N_ARRAY=$(read_config 'print(cfg.SLURM_CONFIG.get("dataset_n_array_jobs", 10))')
 DATASET_CPUS=$(read_config 'print(cfg.SLURM_CONFIG.get("dataset_cpus_per_task", 40))')
 DATASET_TIME=$(read_config 'print(cfg.SLURM_CONFIG.get("dataset_time_limit", "10:00:00"))')
+SLURM_PARTITION_V100=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; print(cfg.SLURM_CONFIG.get("v100_partition", f"{base}@v100"))')
+SLURM_PARTITION_H100=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; print(cfg.SLURM_CONFIG.get("h100_partition", f"{base}@h100"))')
 
 # GPU-type specific SLURM settings
 case "$GPU_TYPE" in
 	v100)
-		PARTITION="${SLURM_ACCOUNT}@v100"
-		QOS="qos_gpu-t3"
+		PARTITION="$SLURM_PARTITION_V100"
+		QOS="qos_gpu-t4"
 		MODULE_TF="tensorflow-gpu/py3/2.16.1"
 		;;
 	h100)
-		PARTITION="${SLURM_ACCOUNT}@h100"
+		PARTITION="$SLURM_PARTITION_H100"
 		QOS="qos_gpu_h100-t4"
 		MODULE_TF="tensorflow-gpu/py3/2.17.0"
 		;;
@@ -93,6 +97,8 @@ mkdir -p "$LOG_DIR"
 echo "=========================================="
 echo "Experiment config : $CONFIG"
 echo "Output base dir   : $OUTPUT_BASE_DIR"
+echo "CPU account       : $SLURM_CPU_ACCOUNT"
+echo "GPU account       : $SLURM_GPU_ACCOUNT"
 echo "GPU type          : $GPU_TYPE"
 echo "Partition         : $PARTITION"
 echo "QOS               : $QOS"
@@ -128,7 +134,7 @@ cat > "$STEP1_SCRIPT" <<SLURM_EOF
 #SBATCH --job-name=create_dataset
 #SBATCH --output=$LOG_DIR/step1_%A_%a.out
 #SBATCH --error=$LOG_DIR/step1_%A_%a.err
-#SBATCH --account=$SLURM_ACCOUNT
+#SBATCH --account=$SLURM_CPU_ACCOUNT
 #SBATCH --cpus-per-task=$DATASET_CPUS
 #SBATCH --time=$DATASET_TIME
 #SBATCH --array=0-$((DATASET_N_ARRAY - 1))
@@ -168,7 +174,7 @@ cat > "$STEP2A_SCRIPT" <<SLURM_EOF
 #SBATCH --job-name=train_image_head
 #SBATCH --output=$LOG_DIR/step2a_%j.out
 #SBATCH --error=$LOG_DIR/step2a_%j.err
-#SBATCH --account=$SLURM_ACCOUNT
+#SBATCH --account=$SLURM_GPU_ACCOUNT
 #SBATCH --partition=$PARTITION
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
@@ -199,7 +205,7 @@ cat > "$STEP2B_SCRIPT" <<SLURM_EOF
 #SBATCH --job-name=train_noise_head
 #SBATCH --output=$LOG_DIR/step2b_%j.out
 #SBATCH --error=$LOG_DIR/step2b_%j.err
-#SBATCH --account=$SLURM_ACCOUNT
+#SBATCH --account=$SLURM_GPU_ACCOUNT
 #SBATCH --partition=$PARTITION
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
@@ -230,7 +236,7 @@ cat > "$STEP2C_SCRIPT" <<SLURM_EOF
 #SBATCH --job-name=train_psf_head
 #SBATCH --output=$LOG_DIR/step2c_%j.out
 #SBATCH --error=$LOG_DIR/step2c_%j.err
-#SBATCH --account=$SLURM_ACCOUNT
+#SBATCH --account=$SLURM_GPU_ACCOUNT
 #SBATCH --partition=$PARTITION
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
@@ -261,7 +267,7 @@ cat > "$STEP3_SCRIPT" <<SLURM_EOF
 #SBATCH --job-name=psf_unc_stage2
 #SBATCH --output=$LOG_DIR/step3_%j.out
 #SBATCH --error=$LOG_DIR/step3_%j.err
-#SBATCH --account=$SLURM_ACCOUNT
+#SBATCH --account=$SLURM_GPU_ACCOUNT
 #SBATCH --partition=$PARTITION
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
@@ -292,7 +298,7 @@ cat > "$STEP4_SCRIPT" <<SLURM_EOF
 #SBATCH --job-name=joint_pinn_fourhead
 #SBATCH --output=$LOG_DIR/step4_%j.out
 #SBATCH --error=$LOG_DIR/step4_%j.err
-#SBATCH --account=$SLURM_ACCOUNT
+#SBATCH --account=$SLURM_GPU_ACCOUNT
 #SBATCH --partition=$PARTITION
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
@@ -323,7 +329,7 @@ cat > "$STEP5_SCRIPT" <<SLURM_EOF
 #SBATCH --job-name=plot_results
 #SBATCH --output=$LOG_DIR/step5_%j.out
 #SBATCH --error=$LOG_DIR/step5_%j.err
-#SBATCH --account=$SLURM_ACCOUNT
+#SBATCH --account=$SLURM_CPU_ACCOUNT
 #SBATCH --cpus-per-task=4
 #SBATCH --time=01:00:00
 #SBATCH --hint=nomultithread
