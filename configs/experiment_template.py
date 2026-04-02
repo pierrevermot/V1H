@@ -337,7 +337,8 @@ SLURM_CONFIG: dict[str, object] = {
 	"gpu_type": "h100",
 	"account": "nab",
 	"cpu_account": "nab@cpu",
-	"gpu_account": "nab",
+	# Optional common GPU account override for all GPU types.
+	# If omitted, per-type defaults below are used.
 	"time_limit": "100:00:00",
 	"cpus_per_task": 24,
 	"exclude_nodes": "",
@@ -345,6 +346,9 @@ SLURM_CONFIG: dict[str, object] = {
 	"dataset_n_array_jobs": 10,
 	"dataset_cpus_per_task": 40,
 	"dataset_time_limit": "10:00:00",
+	# Optional GPU account overrides per GPU type
+	"v100_account": "nab@v100",
+	"h100_account": "nab@h100",
 	# Optional partition overrides per GPU type
 	"v100_partition": "nab@v100",
 	"h100_partition": "nab@h100",

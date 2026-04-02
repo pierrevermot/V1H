@@ -63,7 +63,8 @@ $1
 OUTPUT_BASE_DIR=$(read_config 'print(cfg.OUTPUT_BASE_DIR)')
 SLURM_ACCOUNT=$(read_config 'print(cfg.SLURM_CONFIG.get("account", "nab"))')
 SLURM_CPU_ACCOUNT=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; print(cfg.SLURM_CONFIG.get("cpu_account", f"{base}@cpu"))')
-SLURM_GPU_ACCOUNT=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; print(cfg.SLURM_CONFIG.get("gpu_account", base))')
+SLURM_GPU_ACCOUNT_V100=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; common = cfg.SLURM_CONFIG.get("gpu_account", None); print(cfg.SLURM_CONFIG.get("v100_account", common if common is not None else f"{base}@v100"))')
+SLURM_GPU_ACCOUNT_H100=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "nab")).split("@", 1)[0]; common = cfg.SLURM_CONFIG.get("gpu_account", None); print(cfg.SLURM_CONFIG.get("h100_account", common if common is not None else f"{base}@h100"))')
 SLURM_TIME=$(read_config 'print(cfg.SLURM_CONFIG.get("time_limit", "100:00:00"))')
 SLURM_CPUS=$(read_config 'print(cfg.SLURM_CONFIG.get("cpus_per_task", 24))')
 SLURM_EXCLUDE=$(read_config 'print(cfg.SLURM_CONFIG.get("exclude_nodes", ""))')
@@ -76,11 +77,13 @@ SLURM_PARTITION_H100=$(read_config 'base = str(cfg.SLURM_CONFIG.get("account", "
 # GPU-type specific SLURM settings
 case "$GPU_TYPE" in
 	v100)
+		SLURM_GPU_ACCOUNT="$SLURM_GPU_ACCOUNT_V100"
 		PARTITION="$SLURM_PARTITION_V100"
 		QOS="qos_gpu-t4"
 		MODULE_TF="tensorflow-gpu/py3/2.16.1"
 		;;
 	h100)
+		SLURM_GPU_ACCOUNT="$SLURM_GPU_ACCOUNT_H100"
 		PARTITION="$SLURM_PARTITION_H100"
 		QOS="qos_gpu_h100-t4"
 		MODULE_TF="tensorflow-gpu/py3/2.17.0"
