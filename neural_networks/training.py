@@ -1,0 +1,283 @@
+
+"""Training utilities for U-Net."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import time
+
+import numpy as np
+
+import tensorflow as tf
+
+
+class _LossPrinter(tf.keras.callbacks.Callback):
+	def __init__(self, metric_names: list[str], verbose: bool = True):
+		super().__init__()
+		self.metric_names = metric_names
+		self.verbose = verbose
+
+	def on_epoch_end(self, epoch, logs=None):
+		if not self.verbose or not logs:
+			return
+		parts = []
+		total = logs.get("loss")
+		val_total = logs.get("val_loss")
+		if total is not None:
+			parts.append(f"loss={total:.6f}")
+		if val_total is not None:
+			parts.append(f"val_loss={val_total:.6f}")
+		for name in self.metric_names:
+			if name in logs:
+				parts.append(f"{name}={logs[name]:.6f}")
+		print(f"Epoch {epoch + 1}: " + ", ".join(parts))
+
+
+class _LrTracker(tf.keras.callbacks.Callback):
+	def __init__(self):
+		super().__init__()
+		self.lr_history: list[float] = []
+
+	def on_epoch_end(self, epoch, logs=None):
+		lr = float(tf.keras.backend.get_value(self.model.optimizer.learning_rate))
+		self.lr_history.append(lr)
+
+
+class _SaveBestExamples(tf.keras.callbacks.Callback):
+	def __init__(
+		self,
+		val_dataset: tf.data.Dataset,
+		save_dir: Path,
+		n_examples: int = 100,
+	):
+		super().__init__()
+		self.val_dataset = val_dataset
+		self.save_dir = save_dir
+		self.n_examples = int(n_examples)
+		self.best = None
+
+	def on_epoch_end(self, epoch, logs=None):
+		if not logs or "val_loss" not in logs:
+			return
+		val_loss = logs.get("val_loss")
+		if val_loss is None:
+			return
+		if self.best is None or val_loss < self.best:
+			self.best = val_loss
+			self._save_examples()
+
+	def _save_examples(self):
+		obs_list = []
+		image_list = []
+		psf_list = []
+		noise_list = []
+		pred_list = []
+		count = 0
+
+		for obs_batch, y_true_batch in self.val_dataset:
+			pred_batch = self.model.predict(obs_batch, verbose=0)
+			batch_size = int(obs_batch.shape[0])
+			for i in range(batch_size):
+				if count >= self.n_examples:
+					break
+				obs = obs_batch[i].numpy()
+				y_true = y_true_batch[i].numpy()
+				pred = pred_batch[i]
+
+				image = y_true[..., :1]
+				n_frames = (y_true.shape[-1] - 1) // 2
+				psf = y_true[..., 1 : 1 + n_frames]
+				noise = y_true[..., 1 + n_frames : 1 + 2 * n_frames]
+
+				obs_list.append(obs)
+				image_list.append(image)
+				psf_list.append(psf)
+				noise_list.append(noise)
+				pred_list.append(pred)
+				count += 1
+			if count >= self.n_examples:
+				break
+
+		self.save_dir.mkdir(parents=True, exist_ok=True)
+		np.save(self.save_dir / "examples_obs.npy", np.asarray(obs_list))
+		np.save(self.save_dir / "examples_image.npy", np.asarray(image_list))
+		np.save(self.save_dir / "examples_psf.npy", np.asarray(psf_list))
+		np.save(self.save_dir / "examples_noise.npy", np.asarray(noise_list))
+		np.save(self.save_dir / "examples_pred.npy", np.asarray(pred_list))
+
+
+class _TerminateOnNaNWithBatch(tf.keras.callbacks.Callback):
+	def on_train_batch_end(self, batch, logs=None):
+		if not logs:
+			return
+		for key, value in logs.items():
+			if value is None:
+				continue
+			if not np.isfinite(value):
+				print(f"NaN/Inf detected in {key} at batch {batch}")
+				self.model.stop_training = True
+				return
+
+
+class _BatchHistory(tf.keras.callbacks.Callback):
+	def __init__(self, metric_names: list[str]):
+		super().__init__()
+		self.metric_names = metric_names
+		self.history: dict[str, list[float]] = {name: [] for name in ("loss", *metric_names)}
+
+	def on_train_batch_end(self, batch, logs=None):
+		if not logs:
+			return
+		self.history["loss"].append(float(logs.get("loss", float("nan"))))
+		for name in self.metric_names:
+			self.history[name].append(float(logs.get(name, float("nan"))))
+
+
+def _make_component_metric(name: str, subloss_fn):
+	def metric(y_true, y_pred):
+		return subloss_fn(y_true, y_pred)[name]
+
+	metric.__name__ = name
+	return metric
+
+
+def train_unet(
+	model: tf.keras.Model,
+	loss,
+	dataset: tf.data.Dataset,
+	*,
+	val_dataset: tf.data.Dataset | None = None,
+	n_epochs: int = 100,
+	lr_0: float = 5e-4,
+	lr_decay: float = 33.0,
+	verbose: bool = True,
+	n_steps_per_epoch: int | None = None,
+	use_pinn: bool = True,
+	checkpoint_path: str | Path = "checkpoints/unet_best.keras",
+	subloss_fn=None,
+	extra_callbacks: list[tf.keras.callbacks.Callback] | None = None,
+) -> dict[str, object]:
+	"""Train a U-Net model.
+
+	Parameters
+	----------
+	model : tf.keras.Model
+		Non-compiled model to train (will be compiled inside).
+	loss : callable
+		Loss function.
+	dataset : tf.data.Dataset
+		Training dataset.
+	val_dataset : tf.data.Dataset, optional
+		Validation dataset.
+	n_epochs : int, optional
+		Number of epochs. Default 100.
+	lr_0 : float, optional
+		Initial learning rate. Default 5e-4.
+	lr_decay : float, optional
+		Decay factor for lr schedule: lr = lr_0*10**(-epoch/lr_decay). Default 33.
+	verbose : bool, optional
+		Whether to print losses each epoch. Default True.
+	n_steps_per_epoch : int or None, optional
+		Limit number of batches per epoch. Default None.
+	use_pinn : bool, optional
+		Whether to include the PINN/Charbonnier metric. Default True.
+	checkpoint_path : str or Path, optional
+		Where to save the best model checkpoint.
+	subloss_fn : callable or None, optional
+		Function returning sub-loss components dict. If None, uses loss.components when available.
+	extra_callbacks : list[tf.keras.callbacks.Callback] or None, optional
+		Additional callbacks appended to the default callback list.
+	"""
+	if subloss_fn is None and hasattr(loss, "components"):
+		subloss_fn = loss.components
+
+	metrics = []
+	metric_names: list[str] = []
+	if subloss_fn is not None:
+		metric_list = None
+		if hasattr(loss, "component_names"):
+			metric_list = list(loss.component_names)
+		if metric_list is None:
+			metric_list = [
+				"nll_im",
+				"nll_psf",
+				"nll_noise",
+				"log_sigma2_im",
+				"log_sigma2_psf",
+				"log_sigma2_noise",
+			]
+		if use_pinn and "pinn_charb" not in metric_list:
+			metric_list.append("pinn_charb")
+		if not use_pinn and "pinn_charb" in metric_list:
+			metric_list = [name for name in metric_list if name != "pinn_charb"]
+		for name in metric_list:
+			metrics.append(_make_component_metric(name, subloss_fn))
+			metric_names.append(name)
+
+	optimizer = tf.keras.optimizers.Adam(learning_rate=lr_0, clipnorm=1.0)
+	model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
+	model.summary()
+
+	def _lr_schedule(epoch, _):
+		return lr_0 * 10 ** (-(epoch) / lr_decay)
+
+	callbacks: list[tf.keras.callbacks.Callback] = [
+		tf.keras.callbacks.LearningRateScheduler(_lr_schedule, verbose=0)
+	]
+	callbacks.append(tf.keras.callbacks.TerminateOnNaN())
+	callbacks.append(_TerminateOnNaNWithBatch())
+
+	monitor = "val_loss" if val_dataset is not None else "loss"
+	callbacks.append(
+		tf.keras.callbacks.ModelCheckpoint(
+			filepath=str(checkpoint_path),
+			monitor=monitor,
+			save_best_only=True,
+		)
+	)
+	callbacks.append(_LossPrinter(metric_names=metric_names, verbose=verbose))
+	if val_dataset is not None:
+		save_dir = Path(checkpoint_path).parent / "best_examples"
+		callbacks.append(_SaveBestExamples(val_dataset=val_dataset, save_dir=save_dir))
+
+	batch_history = _BatchHistory(metric_names=metric_names)
+	callbacks.append(batch_history)
+
+	lr_tracker = _LrTracker()
+	callbacks.append(lr_tracker)
+	if extra_callbacks:
+		callbacks.extend(extra_callbacks)
+
+	start_time = time.perf_counter()
+	history = model.fit(
+		dataset,
+		validation_data=val_dataset,
+		epochs=n_epochs,
+		steps_per_epoch=n_steps_per_epoch,
+		verbose=1 if verbose else 0,
+		callbacks=callbacks,
+	)
+	end_time = time.perf_counter()
+
+	best_key = "val_loss" if val_dataset is not None else "loss"
+	best_values = history.history.get(best_key, [])
+	best_value = min(best_values) if best_values else None
+	best_epoch = int(best_values.index(best_value)) + 1 if best_values else None
+
+	subloss_history = {
+		name: history.history.get(name, [])
+		for name in metric_names
+	}
+
+	return {
+		"history": history,
+		"model": model,
+		"checkpoint_path": str(checkpoint_path),
+		"best_metric": best_key,
+		"best_value": best_value,
+		"best_epoch": best_epoch,
+		"lr_history": lr_tracker.lr_history,
+		"duration_s": end_time - start_time,
+		"subloss_history": subloss_history,
+		"batch_history": batch_history.history,
+	}

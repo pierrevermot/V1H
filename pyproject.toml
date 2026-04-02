@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "v1h"
+version = "0.1.0"
+description = "Physics-informed neural network for adaptive-optics image deconvolution"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "tensorflow>=2.13",
+    "matplotlib",
+    "hcipy",
+    "astropy",
+    "joblib",
+]
+
+[project.optional-dependencies]
+gpu = ["cupy-cuda12x"]
+
+[tool.setuptools.packages.find]
+include = [
+    "configs*",
+    "instruments*",
+    "neural_networks*",
+    "noises*",
+    "phases*",
+    "psfs*",
+    "skies*",
+    "utils*",
+    "workflow*",
+]
