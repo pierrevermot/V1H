@@ -10,6 +10,7 @@ import tensorflow as tf
 
 from neural_networks.layers import GroupNormalization, _upsample_bilinear
 from utils.model_utils import _wrap_model_output_activation
+from utils.temp_paths import _resolve_temp_root
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +136,7 @@ def _load_model_from_keras_archive(
 			archive_config["compile_config"] = None
 			wrapper_info = None
 		config_json = json.dumps(archive_config)
-		with tempfile.TemporaryDirectory(prefix="joint_pinn_fourhead_archive_") as tmp_dir:
+		with tempfile.TemporaryDirectory(prefix="joint_pinn_fourhead_archive_", dir=str(_resolve_temp_root())) as tmp_dir:
 			weights_path = Path(tmp_dir) / "model.weights.h5"
 			weights_path.write_bytes(archive.read("model.weights.h5"))
 			try:
@@ -304,7 +305,7 @@ def _infer_model_spec_from_keras_archive(path: Path) -> dict[str, Any]:
 def _load_weights_into_rebuilt_model(model: tf.keras.Model, path: Path) -> tf.keras.Model:
 	if path.suffix == ".keras":
 		with ZipFile(path, "r") as archive:
-			with tempfile.TemporaryDirectory(prefix="joint_pinn_fourhead_weights_") as tmp_dir:
+			with tempfile.TemporaryDirectory(prefix="joint_pinn_fourhead_weights_", dir=str(_resolve_temp_root())) as tmp_dir:
 				weights_path = Path(tmp_dir) / "model.weights.h5"
 				weights_path.write_bytes(archive.read("model.weights.h5"))
 				model.load_weights(weights_path)

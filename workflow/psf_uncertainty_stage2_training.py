@@ -66,6 +66,7 @@ from utils.model_io import (
 )
 from utils.model_utils import _resolve_model_input_shape_3d as _resolve_model_input_shape, _extract_prediction_mean
 from utils.normalization import _apply_norm_tf
+from utils.temp_paths import _resolve_temp_root as _resolve_shared_temp_root
 from utils.tfrecord_io import _decode_raw_example, _load_preview_raw_from_first_tfrecord
 
 
@@ -94,7 +95,7 @@ def _resolve_temp_root(run_dir: Path) -> Path:
 	if _TEMP_ROOT is not None:
 		root = _TEMP_ROOT
 	else:
-		root = run_dir / "tmp"
+		root = _resolve_shared_temp_root(subdir="V1H_stage2_tmp")
 	root.mkdir(parents=True, exist_ok=True)
 	return root
 
