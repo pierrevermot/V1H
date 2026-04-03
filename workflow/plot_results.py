@@ -65,6 +65,7 @@ from utils.tfrecord_io import (
 	_decode_raw_example,
 	_iter_tfrecord_records,
 	_load_selected_tfrecord_arrays,
+	_resolve_data_path,
 	_resolve_joint_tfrecord_path,
 	_resolve_tfrecord_path,
 )
