@@ -287,7 +287,7 @@ PSF_UNC_CONFIG: dict[str, object] = {
 	"normalization": "none",
 	"group_norm_groups": 8,
 	"weight_decay": 0,
-	"inner_activation_function": "softplus",
+	"inner_activation_function": "relu",
 	"output_activation_function": "linear",
 	"normalize_output_sum": False,
 	"normalize_with_first": False,
