@@ -30,6 +30,9 @@ class _LossPrinter(tf.keras.callbacks.Callback):
 		for name in self.metric_names:
 			if name in logs:
 				parts.append(f"{name}={logs[name]:.6f}")
+			val_name = f"val_{name}"
+			if val_name in logs:
+				parts.append(f"{val_name}={logs[val_name]:.6f}")
 		print(f"Epoch {epoch + 1}: " + ", ".join(parts))
 
 
@@ -172,6 +175,65 @@ def _make_component_metric(name: str, subloss_fn):
 	return metric
 
 
+def _collect_batch_median_metrics(
+	model: tf.keras.Model,
+	dataset: tf.data.Dataset,
+	*,
+	loss_fn,
+	metric_fns: dict[str, callable],
+) -> dict[str, float]:
+	metric_history: dict[str, list[float]] = {"val_loss": []}
+	for name in metric_fns:
+		metric_history[f"val_{name}"] = []
+
+	for obs_batch, y_true_batch in dataset:
+		y_pred_batch = model(obs_batch, training=False)
+		loss_value = tf.convert_to_tensor(loss_fn(y_true_batch, y_pred_batch))
+		if model.losses:
+			loss_value = loss_value + tf.add_n(model.losses)
+		metric_history["val_loss"].append(float(loss_value.numpy()))
+
+		for name, metric_fn in metric_fns.items():
+			value = tf.convert_to_tensor(metric_fn(y_true_batch, y_pred_batch))
+			metric_history[f"val_{name}"].append(float(value.numpy()))
+
+	return {
+		name: float(np.median(values))
+		for name, values in metric_history.items()
+		if values
+	}
+
+
+class _MedianValidationMetrics(tf.keras.callbacks.Callback):
+	def __init__(
+		self,
+		val_dataset: tf.data.Dataset,
+		*,
+		loss_fn,
+		metric_fns: dict[str, callable],
+	):
+		super().__init__()
+		self.val_dataset = val_dataset
+		self.loss_fn = loss_fn
+		self.metric_fns = metric_fns
+		self.history: dict[str, list[float]] = {"val_loss": []}
+		for name in metric_fns:
+			self.history[f"val_{name}"] = []
+
+	def on_epoch_end(self, epoch, logs=None):
+		if logs is None:
+			return
+		median_metrics = _collect_batch_median_metrics(
+			self.model,
+			self.val_dataset,
+			loss_fn=self.loss_fn,
+			metric_fns=self.metric_fns,
+		)
+		for name, value in median_metrics.items():
+			logs[name] = value
+			self.history.setdefault(name, []).append(value)
+
+
 def train_unet(
 	model: tf.keras.Model,
 	loss,
@@ -249,6 +311,7 @@ def train_unet(
 	optimizer = tf.keras.optimizers.Adam(learning_rate=lr_0, clipnorm=1.0)
 	model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
 	model.summary()
+	metric_fns = {name: metric for name, metric in zip(metric_names, metrics)}
 
 	def _lr_schedule(epoch, _):
 		return lr_0 * 10 ** (-(epoch) / lr_decay)
@@ -258,6 +321,15 @@ def train_unet(
 	]
 	callbacks.append(tf.keras.callbacks.TerminateOnNaN())
 	callbacks.append(_TerminateOnNaNWithBatch())
+
+	median_validation = None
+	if val_dataset is not None:
+		median_validation = _MedianValidationMetrics(
+			val_dataset=val_dataset,
+			loss_fn=loss,
+			metric_fns=metric_fns,
+		)
+		callbacks.append(median_validation)
 
 	monitor = "val_loss" if val_dataset is not None else "loss"
 	callbacks.append(
@@ -289,12 +361,15 @@ def train_unet(
 	start_time = time.perf_counter()
 	history = model.fit(
 		dataset,
-		validation_data=val_dataset,
+		validation_data=None,
 		epochs=n_epochs,
 		steps_per_epoch=n_steps_per_epoch,
 		verbose=1 if verbose else 0,
 		callbacks=callbacks,
 	)
+	if median_validation is not None:
+		for name, values in median_validation.history.items():
+			history.history[name] = list(values)
 	end_time = time.perf_counter()
 
 	best_key = "val_loss" if val_dataset is not None else "loss"
@@ -306,6 +381,9 @@ def train_unet(
 		name: history.history.get(name, [])
 		for name in metric_names
 	}
+	if val_dataset is not None:
+		for name in metric_names:
+			subloss_history[f"val_{name}"] = history.history.get(f"val_{name}", [])
 
 	return {
 		"history": history,

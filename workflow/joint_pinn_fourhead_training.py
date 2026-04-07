@@ -804,12 +804,15 @@ def _evaluate_and_print(model: tf.keras.Model, dataset: tf.data.Dataset, *, labe
 	return result
 
 
-class _ValidationLossPrinter(tf.keras.callbacks.Callback):
+class _MedianValidationMetrics(tf.keras.callbacks.Callback):
 	def __init__(self, metric_names: list[str], val_dataset: tf.data.Dataset, verbose: bool = True):
 		super().__init__()
 		self.metric_names = metric_names
 		self.val_dataset = val_dataset
 		self.verbose = verbose
+		self.history: dict[str, list[float]] = {"val_loss": []}
+		for name in metric_names:
+			self.history[f"val_{name}"] = []
 
 	def _collect_validation_batch_metrics(self) -> dict[str, float]:
 		return _collect_batch_median_metrics(
@@ -820,7 +823,15 @@ class _ValidationLossPrinter(tf.keras.callbacks.Callback):
 		)
 
 	def on_epoch_end(self, epoch, logs=None):
-		if not self.verbose or not logs:
+		if logs is None:
+			return
+		median_metrics = self._collect_validation_batch_metrics()
+		for name, value in median_metrics.items():
+			log_name = "val_loss" if name == "loss" else f"val_{name}"
+			logs[log_name] = value
+			self.history.setdefault(log_name, []).append(value)
+
+		if not self.verbose:
 			return
 		parts = []
 		val_total = logs.get("val_loss")
@@ -830,14 +841,6 @@ class _ValidationLossPrinter(tf.keras.callbacks.Callback):
 			val_name = f"val_{name}"
 			if val_name in logs:
 				parts.append(f"{val_name}={logs[val_name]:.6f}")
-		median_metrics = self._collect_validation_batch_metrics()
-		if median_metrics:
-			parts.append("validation_batch_medians")
-			if "loss" in median_metrics:
-				parts.append(f"val_median_loss={median_metrics['loss']:.6f}")
-			for name in self.metric_names:
-				if name in median_metrics:
-					parts.append(f"val_median_{name}={median_metrics[name]:.6f}")
 		if parts:
 			print(f"[joint_pinn_fourhead] Epoch {epoch + 1} validation: " + ", ".join(parts))
 
@@ -1063,6 +1066,12 @@ def main() -> None:
 		_TerminateOnNaNWithBatch(),
 	]
 	callbacks.append(_TrainingProgbar(verbose=verbose))
+	median_validation = _MedianValidationMetrics(
+		metric_names=[m.name for m in model.metrics if m.name != "loss"],
+		val_dataset=val_ds,
+		verbose=verbose,
+	)
+	callbacks.append(median_validation)
 	callbacks.append(
 		tf.keras.callbacks.ModelCheckpoint(
 			filepath=str(checkpoint_path),
@@ -1070,7 +1079,6 @@ def main() -> None:
 			save_best_only=True,
 		)
 	)
-	callbacks.append(_ValidationLossPrinter(metric_names=[m.name for m in model.metrics if m.name != "loss"], val_dataset=val_ds, verbose=verbose))
 	callbacks.append(
 		_SaveBestExamples(
 			val_dataset=val_ds,
@@ -1088,12 +1096,14 @@ def main() -> None:
 	print("[joint_pinn_fourhead] Training model")
 	history = model.fit(
 		train_ds,
-		validation_data=val_ds,
+		validation_data=None,
 		epochs=n_epochs,
 		steps_per_epoch=n_steps_per_epoch,
 		verbose=0,
 		callbacks=callbacks,
 	)
+	for name, values in median_validation.history.items():
+		history.history[name] = list(values)
 
 	print("[joint_pinn_fourhead] Saving final model")
 	model_path = run_dir / "model_final.keras"
