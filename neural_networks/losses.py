@@ -143,13 +143,12 @@ def make_loss(
 
 	def loss_components(y_true: tf.Tensor, y_pred: tf.Tensor) -> dict[str, tf.Tensor]:
 		channels = tf.shape(y_true)[-1]
-		base = tf.cast(fit_im, channels.dtype)
-		denom = tf.cast(fit_psf, channels.dtype) + tf.cast(fit_noise, channels.dtype)
-		n_frames = tf.where(
-			denom > 0,
-			(channels - base) // denom,
-			tf.constant(0, dtype=channels.dtype),
-		)
+		base = tf.cast(int(fit_im), channels.dtype)
+		frame_component_count = int(fit_psf) + int(fit_noise)
+		if frame_component_count > 0:
+			n_frames = (channels - base) // tf.cast(frame_component_count, channels.dtype)
+		else:
+			n_frames = tf.constant(0, dtype=channels.dtype)
 
 		pred, log_sigma2 = _split_prediction_and_uncertainty(y_pred)
 		truth_im, truth_psf, truth_noise = _split_components(

@@ -169,10 +169,14 @@ class _BatchHistory(tf.keras.callbacks.Callback):
 
 def _make_component_metric(name: str, subloss_fn):
 	def metric(y_true, y_pred):
-		return subloss_fn(y_true, y_pred)[name]
+		return tf.reduce_mean(tf.convert_to_tensor(subloss_fn(y_true, y_pred)[name]))
 
 	metric.__name__ = name
 	return metric
+
+
+def _scalarize_metric_value(value) -> tf.Tensor:
+	return tf.reduce_mean(tf.convert_to_tensor(value))
 
 
 def _collect_batch_median_metrics(
@@ -188,13 +192,13 @@ def _collect_batch_median_metrics(
 
 	for obs_batch, y_true_batch in dataset:
 		y_pred_batch = model(obs_batch, training=False)
-		loss_value = tf.convert_to_tensor(loss_fn(y_true_batch, y_pred_batch))
+		loss_value = _scalarize_metric_value(loss_fn(y_true_batch, y_pred_batch))
 		if model.losses:
 			loss_value = loss_value + tf.add_n(model.losses)
 		metric_history["val_loss"].append(float(loss_value.numpy()))
 
 		for name, metric_fn in metric_fns.items():
-			value = tf.convert_to_tensor(metric_fn(y_true_batch, y_pred_batch))
+			value = _scalarize_metric_value(metric_fn(y_true_batch, y_pred_batch))
 			metric_history[f"val_{name}"].append(float(value.numpy()))
 
 	return {
