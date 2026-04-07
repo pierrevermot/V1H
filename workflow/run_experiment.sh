@@ -4,6 +4,8 @@
 #
 # Usage:
 #   ./run_experiment.sh <config.py> [--gpu v100|h100] [--dry-run]
+#       [--skip-step1] [--skip-step2a] [--skip-step2b] [--skip-step2c]
+#       [--skip-step3] [--skip-step4] [--skip-step5]
 #
 # Steps (with SLURM job dependencies):
 #   1. Create TFRecord dataset            (CPU)
@@ -24,19 +26,33 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 CONFIG=""
 GPU_TYPE="h100"
 DRY_RUN=false
+SKIP_STEP1=false
+SKIP_STEP2A=false
+SKIP_STEP2B=false
+SKIP_STEP2C=false
+SKIP_STEP3=false
+SKIP_STEP4=false
+SKIP_STEP5=false
 CPU_MODULE_TF="tensorflow-gpu/py3/2.16.1"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--gpu)    GPU_TYPE="$2"; shift 2 ;;
 		--dry-run) DRY_RUN=true; shift ;;
+		--skip-step1) SKIP_STEP1=true; shift ;;
+		--skip-step2a) SKIP_STEP2A=true; shift ;;
+		--skip-step2b) SKIP_STEP2B=true; shift ;;
+		--skip-step2c) SKIP_STEP2C=true; shift ;;
+		--skip-step3) SKIP_STEP3=true; shift ;;
+		--skip-step4) SKIP_STEP4=true; shift ;;
+		--skip-step5) SKIP_STEP5=true; shift ;;
 		-*)       echo "Unknown option: $1" >&2; exit 1 ;;
 		*)        CONFIG="$1"; shift ;;
 	esac
 done
 
 if [[ -z "$CONFIG" ]]; then
-	echo "Usage: $0 <config.py> [--gpu v100|h100] [--dry-run]" >&2
+	echo "Usage: $0 <config.py> [--gpu v100|h100] [--dry-run] [--skip-step1] [--skip-step2a] [--skip-step2b] [--skip-step2c] [--skip-step3] [--skip-step4] [--skip-step5]" >&2
 	exit 1
 fi
 CONFIG="$(realpath "$CONFIG")"
@@ -118,6 +134,13 @@ echo "CPU account       : $SLURM_CPU_ACCOUNT"
 echo "GPU account       : $SLURM_GPU_ACCOUNT"
 echo "GPU type          : $GPU_TYPE"
 echo "QOS               : $QOS"
+echo "Skip step 1       : $SKIP_STEP1"
+echo "Skip step 2a      : $SKIP_STEP2A"
+echo "Skip step 2b      : $SKIP_STEP2B"
+echo "Skip step 2c      : $SKIP_STEP2C"
+echo "Skip step 3       : $SKIP_STEP3"
+echo "Skip step 4       : $SKIP_STEP4"
+echo "Skip step 5       : $SKIP_STEP5"
 echo "=========================================="
 
 # ---------------------------------------------------------------------------
@@ -127,6 +150,27 @@ EXCLUDE_OPT=""
 if [[ -n "$SLURM_EXCLUDE" ]]; then
 	EXCLUDE_OPT="#SBATCH --exclude=$SLURM_EXCLUDE"
 fi
+
+STEP1_DEPENDENCY_OPT=""
+STEP3_DEPENDENCY_OPT=""
+STEP4_DEPENDENCY_OPT=""
+STEP5_DEPENDENCY_OPT=""
+
+join_dependency_opt() {
+	local dep_ids=()
+	for dep in "$@"; do
+		if [[ -n "$dep" && "$dep" != "SKIPPED" ]]; then
+			dep_ids+=("$dep")
+		fi
+	done
+	if [[ ${#dep_ids[@]} -eq 0 ]]; then
+		printf '%s' ""
+		return
+	fi
+	local joined
+	joined=$(IFS=:; echo "${dep_ids[*]}")
+	printf '#SBATCH --dependency=afterok:%s' "$joined"
+}
 
 # ---------------------------------------------------------------------------
 # Helper: submit or print
@@ -144,8 +188,13 @@ submit_job() {
 # ===========================================================================
 # Step 1: Create dataset (CPU array job)
 # ===========================================================================
-STEP1_SCRIPT="$LOG_DIR/step1_create_dataset.sh"
-cat > "$STEP1_SCRIPT" <<SLURM_EOF
+if $SKIP_STEP1; then
+	JOB1="SKIPPED"
+	echo "Step 1 (create dataset)      : skipped"
+	STEP1_DEPENDENCY_OPT=""
+else
+	STEP1_SCRIPT="$LOG_DIR/step1_create_dataset.sh"
+	cat > "$STEP1_SCRIPT" <<SLURM_EOF
 #!/usr/bin/env bash
 #SBATCH --job-name=create_dataset
 #SBATCH --output=$LOG_DIR/step1_%A_%a.out
@@ -209,15 +258,21 @@ if [[ "\$SLURM_ARRAY_TASK_ID" -eq 0 ]]; then
 		--parallel-mode joblib
 fi
 SLURM_EOF
-chmod +x "$STEP1_SCRIPT"
-JOB1=$(submit_job "$STEP1_SCRIPT")
-echo "Step 1 (create dataset)      : JobID=$JOB1"
+	chmod +x "$STEP1_SCRIPT"
+	JOB1=$(submit_job "$STEP1_SCRIPT")
+	echo "Step 1 (create dataset)      : JobID=$JOB1"
+	STEP1_DEPENDENCY_OPT="#SBATCH --dependency=afterok:$JOB1"
+fi
 
 # ===========================================================================
 # Step 2a: Train image head
 # ===========================================================================
-STEP2A_SCRIPT="$LOG_DIR/step2a_image_head.sh"
-cat > "$STEP2A_SCRIPT" <<SLURM_EOF
+if $SKIP_STEP2A; then
+	JOB2A="SKIPPED"
+	echo "Step 2a (image head)         : skipped"
+else
+	STEP2A_SCRIPT="$LOG_DIR/step2a_image_head.sh"
+	cat > "$STEP2A_SCRIPT" <<SLURM_EOF
 #!/usr/bin/env bash
 #SBATCH --job-name=train_image_head
 #SBATCH --output=$LOG_DIR/step2a_%j.out
@@ -229,7 +284,7 @@ cat > "$STEP2A_SCRIPT" <<SLURM_EOF
 #SBATCH --time=$SLURM_TIME
 #SBATCH --hint=nomultithread
 $GPU_CONSTRAINT
-#SBATCH --dependency=afterok:$JOB1
+$STEP1_DEPENDENCY_OPT
 $EXCLUDE_OPT
 
 module purge
@@ -241,15 +296,20 @@ cd "$ROOT_DIR"
 python3 -u workflow/independent_training.py \\
 	--config "$CONFIG" --head-target im
 SLURM_EOF
-chmod +x "$STEP2A_SCRIPT"
-JOB2A=$(submit_job "$STEP2A_SCRIPT")
-echo "Step 2a (image head)         : JobID=$JOB2A"
+	chmod +x "$STEP2A_SCRIPT"
+	JOB2A=$(submit_job "$STEP2A_SCRIPT")
+	echo "Step 2a (image head)         : JobID=$JOB2A"
+fi
 
 # ===========================================================================
 # Step 2b: Train noise head
 # ===========================================================================
-STEP2B_SCRIPT="$LOG_DIR/step2b_noise_head.sh"
-cat > "$STEP2B_SCRIPT" <<SLURM_EOF
+if $SKIP_STEP2B; then
+	JOB2B="SKIPPED"
+	echo "Step 2b (noise head)         : skipped"
+else
+	STEP2B_SCRIPT="$LOG_DIR/step2b_noise_head.sh"
+	cat > "$STEP2B_SCRIPT" <<SLURM_EOF
 #!/usr/bin/env bash
 #SBATCH --job-name=train_noise_head
 #SBATCH --output=$LOG_DIR/step2b_%j.out
@@ -261,7 +321,7 @@ cat > "$STEP2B_SCRIPT" <<SLURM_EOF
 #SBATCH --time=$SLURM_TIME
 #SBATCH --hint=nomultithread
 $GPU_CONSTRAINT
-#SBATCH --dependency=afterok:$JOB1
+$STEP1_DEPENDENCY_OPT
 $EXCLUDE_OPT
 
 module purge
@@ -273,15 +333,20 @@ cd "$ROOT_DIR"
 python3 -u workflow/independent_training.py \\
 	--config "$CONFIG" --head-target noise
 SLURM_EOF
-chmod +x "$STEP2B_SCRIPT"
-JOB2B=$(submit_job "$STEP2B_SCRIPT")
-echo "Step 2b (noise head)         : JobID=$JOB2B"
+	chmod +x "$STEP2B_SCRIPT"
+	JOB2B=$(submit_job "$STEP2B_SCRIPT")
+	echo "Step 2b (noise head)         : JobID=$JOB2B"
+fi
 
 # ===========================================================================
 # Step 2c: Train PSF head
 # ===========================================================================
-STEP2C_SCRIPT="$LOG_DIR/step2c_psf_head.sh"
-cat > "$STEP2C_SCRIPT" <<SLURM_EOF
+if $SKIP_STEP2C; then
+	JOB2C="SKIPPED"
+	echo "Step 2c (PSF head)           : skipped"
+else
+	STEP2C_SCRIPT="$LOG_DIR/step2c_psf_head.sh"
+	cat > "$STEP2C_SCRIPT" <<SLURM_EOF
 #!/usr/bin/env bash
 #SBATCH --job-name=train_psf_head
 #SBATCH --output=$LOG_DIR/step2c_%j.out
@@ -293,7 +358,7 @@ cat > "$STEP2C_SCRIPT" <<SLURM_EOF
 #SBATCH --time=$SLURM_TIME
 #SBATCH --hint=nomultithread
 $GPU_CONSTRAINT
-#SBATCH --dependency=afterok:$JOB1
+$STEP1_DEPENDENCY_OPT
 $EXCLUDE_OPT
 
 module purge
@@ -305,15 +370,22 @@ cd "$ROOT_DIR"
 python3 -u workflow/independent_training.py \\
 	--config "$CONFIG" --head-target psf
 SLURM_EOF
-chmod +x "$STEP2C_SCRIPT"
-JOB2C=$(submit_job "$STEP2C_SCRIPT")
-echo "Step 2c (PSF head)           : JobID=$JOB2C"
+	chmod +x "$STEP2C_SCRIPT"
+	JOB2C=$(submit_job "$STEP2C_SCRIPT")
+	echo "Step 2c (PSF head)           : JobID=$JOB2C"
+fi
+
+STEP3_DEPENDENCY_OPT=$(join_dependency_opt "$JOB2C")
 
 # ===========================================================================
 # Step 3: PSF uncertainty (stage 2) — depends on PSF head
 # ===========================================================================
-STEP3_SCRIPT="$LOG_DIR/step3_psf_uncertainty.sh"
-cat > "$STEP3_SCRIPT" <<SLURM_EOF
+if $SKIP_STEP3; then
+	JOB3="SKIPPED"
+	echo "Step 3 (PSF uncertainty)     : skipped"
+else
+	STEP3_SCRIPT="$LOG_DIR/step3_psf_uncertainty.sh"
+	cat > "$STEP3_SCRIPT" <<SLURM_EOF
 #!/usr/bin/env bash
 #SBATCH --job-name=psf_unc_stage2
 #SBATCH --output=$LOG_DIR/step3_%j.out
@@ -325,7 +397,7 @@ cat > "$STEP3_SCRIPT" <<SLURM_EOF
 #SBATCH --time=$SLURM_TIME
 #SBATCH --hint=nomultithread
 $GPU_CONSTRAINT
-#SBATCH --dependency=afterok:$JOB2C
+$STEP3_DEPENDENCY_OPT
 $EXCLUDE_OPT
 
 module purge
@@ -337,15 +409,22 @@ cd "$ROOT_DIR"
 python3 -u workflow/psf_uncertainty_stage2_training.py \\
 	--config "$CONFIG"
 SLURM_EOF
-chmod +x "$STEP3_SCRIPT"
-JOB3=$(submit_job "$STEP3_SCRIPT")
-echo "Step 3 (PSF uncertainty)     : JobID=$JOB3"
+	chmod +x "$STEP3_SCRIPT"
+	JOB3=$(submit_job "$STEP3_SCRIPT")
+	echo "Step 3 (PSF uncertainty)     : JobID=$JOB3"
+fi
+
+STEP4_DEPENDENCY_OPT=$(join_dependency_opt "$JOB2A" "$JOB2B" "$JOB3")
 
 # ===========================================================================
 # Step 4: Joint PINN four-head — depends on im, noise, and PSF unc
 # ===========================================================================
-STEP4_SCRIPT="$LOG_DIR/step4_joint_pinn.sh"
-cat > "$STEP4_SCRIPT" <<SLURM_EOF
+if $SKIP_STEP4; then
+	JOB4="SKIPPED"
+	echo "Step 4 (joint PINN)          : skipped"
+else
+	STEP4_SCRIPT="$LOG_DIR/step4_joint_pinn.sh"
+	cat > "$STEP4_SCRIPT" <<SLURM_EOF
 #!/usr/bin/env bash
 #SBATCH --job-name=joint_pinn_fourhead
 #SBATCH --output=$LOG_DIR/step4_%j.out
@@ -357,7 +436,7 @@ cat > "$STEP4_SCRIPT" <<SLURM_EOF
 #SBATCH --time=$SLURM_TIME
 #SBATCH --hint=nomultithread
 $GPU_CONSTRAINT
-#SBATCH --dependency=afterok:$JOB2A:$JOB2B:$JOB3
+$STEP4_DEPENDENCY_OPT
 $EXCLUDE_OPT
 
 module purge
@@ -369,15 +448,22 @@ cd "$ROOT_DIR"
 python3 -u workflow/joint_pinn_fourhead_training.py \\
 	--config "$CONFIG"
 SLURM_EOF
-chmod +x "$STEP4_SCRIPT"
-JOB4=$(submit_job "$STEP4_SCRIPT")
-echo "Step 4 (joint PINN)          : JobID=$JOB4"
+	chmod +x "$STEP4_SCRIPT"
+	JOB4=$(submit_job "$STEP4_SCRIPT")
+	echo "Step 4 (joint PINN)          : JobID=$JOB4"
+fi
+
+STEP5_DEPENDENCY_OPT=$(join_dependency_opt "$JOB4")
 
 # ===========================================================================
 # Step 5: Plot results — depends on joint PINN
 # ===========================================================================
-STEP5_SCRIPT="$LOG_DIR/step5_plot_results.sh"
-cat > "$STEP5_SCRIPT" <<SLURM_EOF
+if $SKIP_STEP5; then
+	JOB5="SKIPPED"
+	echo "Step 5 (plot results)        : skipped"
+else
+	STEP5_SCRIPT="$LOG_DIR/step5_plot_results.sh"
+	cat > "$STEP5_SCRIPT" <<SLURM_EOF
 #!/usr/bin/env bash
 #SBATCH --job-name=plot_results
 #SBATCH --output=$LOG_DIR/step5_%j.out
@@ -386,7 +472,7 @@ cat > "$STEP5_SCRIPT" <<SLURM_EOF
 #SBATCH --cpus-per-task=4
 #SBATCH --time=01:00:00
 #SBATCH --hint=nomultithread
-#SBATCH --dependency=afterok:$JOB4
+$STEP5_DEPENDENCY_OPT
 $EXCLUDE_OPT
 
 module purge
@@ -404,15 +490,40 @@ print(cfg.JOINT_PINN_CONFIG['run_name'])
 python3 -u workflow/plot_results.py \\
 	--run-dir "$OUTPUT_BASE_DIR/\$JOINT_RUN_NAME"
 SLURM_EOF
-chmod +x "$STEP5_SCRIPT"
-JOB5=$(submit_job "$STEP5_SCRIPT")
-echo "Step 5 (plot results)        : JobID=$JOB5"
+	chmod +x "$STEP5_SCRIPT"
+	JOB5=$(submit_job "$STEP5_SCRIPT")
+	echo "Step 5 (plot results)        : JobID=$JOB5"
+fi
 
 echo ""
 echo "=========================================="
 echo "All jobs submitted. Pipeline:"
-echo "  Step 1 ($JOB1) -> Steps 2a,2b,2c ($JOB2A,$JOB2B,$JOB2C)"
-echo "  Step 2c ($JOB2C) -> Step 3 ($JOB3)"
-echo "  Steps 2a+2b+3 ($JOB2A,$JOB2B,$JOB3) -> Step 4 ($JOB4)"
-echo "  Step 4 ($JOB4) -> Step 5 ($JOB5)"
+if $SKIP_STEP1; then
+	echo "  Step 1 skipped -> Steps 2a,2b,2c ($JOB2A,$JOB2B,$JOB2C)"
+else
+	echo "  Step 1 ($JOB1) -> Steps 2a,2b,2c ($JOB2A,$JOB2B,$JOB2C)"
+fi
+if $SKIP_STEP3; then
+	echo "  Step 3 skipped (reusing existing PSF-unc output)"
+else
+	if $SKIP_STEP2C; then
+		echo "  Step 2c skipped -> Step 3 ($JOB3) reuses existing PSF head"
+	else
+		echo "  Step 2c ($JOB2C) -> Step 3 ($JOB3)"
+	fi
+fi
+if $SKIP_STEP4; then
+	echo "  Step 4 skipped (reusing existing joint model)"
+else
+	echo "  Steps 2a+2b+3 ($JOB2A,$JOB2B,$JOB3) -> Step 4 ($JOB4)"
+fi
+if $SKIP_STEP5; then
+	echo "  Step 5 skipped"
+else
+	if $SKIP_STEP4; then
+		echo "  Step 4 skipped -> Step 5 ($JOB5) reuses existing joint run"
+	else
+		echo "  Step 4 ($JOB4) -> Step 5 ($JOB5)"
+	fi
+fi
 echo "=========================================="
