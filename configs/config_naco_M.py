@@ -171,6 +171,65 @@ DATASET_GEN_CONFIG: dict[str, object] = {
 
 
 # =============================================================================
+# GalSim testing dataset configuration
+# =============================================================================
+
+GALSIM_TEST_CONFIG: dict[str, object] = {
+	"output_dir": f"{DATASET_GEN_CONFIG['output_dir']}/galsim_test",
+	"seed": RNG_SEED if RNG_SEED is not None else 12345,
+	"write_tfrecords": True,
+	"tfrecord_name": "batch_0000.tfrecord",
+	"n_plot_examples": 20,
+	"n_scenes": 10,
+	"n_psfs": 10,
+	"n_noise_levels": 10,
+	"point_source_sigma_pix": 0.1,
+	"diam_m": VLT_PRIMARY_DIAMETER_M,
+	"central_obscuration_m": VLT_CENTRAL_OBSCURATION_DIAMETER_M,
+	"noise_sigma_min": 0.5,
+	"noise_sigma_max": 24.0,
+	"image_config": {
+		"primary_sersic_n_range": [0.8, 4.5],
+		"primary_half_light_radius_arcsec_range": [0.08, 0.28],
+		"primary_flux_range": [2.5e4, 7.5e4],
+		"primary_axis_ratio_range": [0.45, 0.95],
+		"primary_offset_arcsec_range": [-0.18, 0.18],
+		"secondary_disk_probability": 0.9,
+		"secondary_half_light_radius_arcsec_range": [0.12, 0.40],
+		"secondary_flux_range": [0.7e4, 3.5e4],
+		"secondary_axis_ratio_range": [0.35, 0.90],
+		"secondary_relative_offset_arcsec_range": [-0.20, 0.20],
+		"companion_probability": 0.55,
+		"companion_sersic_n_range": [0.8, 2.5],
+		"companion_half_light_radius_arcsec_range": [0.03, 0.10],
+		"companion_flux_range": [0.2e4, 1.0e4],
+		"companion_axis_ratio_range": [0.5, 1.0],
+		"companion_offset_arcsec_range": [-0.90, 0.90],
+		"n_point_sources_range": [1, 4],
+		"point_source_flux_range": [0.25e4, 2.2e4],
+		"point_source_offset_arcsec_range": [-1.15, 1.15],
+	},
+	"psf_config": {
+		"aberration_amplitude_range": [0.004, 0.030],
+		"aberration_scales": {
+			"defocus": 1.00,
+			"astig1": 0.70,
+			"astig2": 0.70,
+			"coma1": 0.45,
+			"coma2": 0.45,
+			"trefoil1": 0.30,
+			"trefoil2": 0.30,
+			"spher": 0.25,
+		},
+		"oversampling": 1.5,
+		"pad_factor": 1.5,
+	},
+	"slurm_cpus_per_task": 4,
+	"slurm_time_limit": "02:00:00",
+}
+
+
+# =============================================================================
 # Dataset loading configuration
 # =============================================================================
 
@@ -326,6 +385,21 @@ JOINT_PINN_CONFIG: dict[str, object] = {
 	"initial_eval_train_steps": 8,
 	"initial_eval_val_steps": 8,
 	"run_name": "joint_pinn_fourhead",
+}
+
+
+# =============================================================================
+# Testing-time evaluation on val and GalSim datasets
+# =============================================================================
+
+TEST_ON_GALSIM_CONFIG: dict[str, object] = {
+	"algorithm": "joint_pinn",
+	"run_name": JOINT_PINN_CONFIG["run_name"],
+	"model_label": "best_model",
+	"eval_batch_size": DATASET_LOAD_CONFIG["val_batch_size"],
+	"output_dir": f"{OUTPUT_BASE_DIR}/{JOINT_PINN_CONFIG['run_name']}/test_on_galsim",
+	"slurm_cpus_per_task": 8,
+	"slurm_time_limit": "04:00:00",
 }
 
 
