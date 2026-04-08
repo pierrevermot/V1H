@@ -316,7 +316,6 @@ def _prepare_stage2_example(
 		pred = pred[0]
 	pred = tf.convert_to_tensor(pred)
 	pred_mean = _extract_prediction_mean(pred, tf.shape(psf)[-1])
-	pred_mean = _apply_norm_tf(pred_mean, norm_psf, spatial_axis=1)
 	pred_mean = tf.stop_gradient(tf.squeeze(pred_mean, axis=0))
 	stage2_input = tf.concat([obs, pred_mean], axis=-1)
 	target = tf.concat([psf, pred_mean], axis=-1)
@@ -357,7 +356,6 @@ def _prepare_stage2_arrays_numpy(
 		pred = pred[0]
 	pred = tf.convert_to_tensor(pred)
 	pred_mean = _extract_prediction_mean(pred, tf.constant(psf_hwf.shape[-1], dtype=tf.int32))
-	pred_mean = _apply_norm_tf(pred_mean, norm_psf, spatial_axis=1)
 	pred_mean_hwf = np.asarray(tf.stop_gradient(tf.squeeze(pred_mean, axis=0)).numpy(), dtype=np.float32)
 
 	stage2_input = np.concatenate([obs_hwf, pred_mean_hwf], axis=-1).astype(np.float32)
@@ -399,7 +397,6 @@ def _prepare_stage2_batch_arrays_numpy(
 		pred = pred[0]
 	pred = tf.convert_to_tensor(pred)
 	pred_mean = _extract_prediction_mean(pred, tf.constant(psf_hwf.shape[-1], dtype=tf.int32))
-	pred_mean = _apply_norm_tf(pred_mean, norm_psf, spatial_axis=1)
 	pred_mean_hwf = np.asarray(tf.stop_gradient(pred_mean).numpy(), dtype=np.float32)
 
 	stage2_input_batch = np.concatenate([obs_hwf, pred_mean_hwf], axis=-1).astype(np.float32)
