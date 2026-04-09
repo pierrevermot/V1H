@@ -402,6 +402,7 @@ TEST_ON_GALSIM_CONFIG: dict[str, object] = {
 	"plot_examples": 100,
 	"plot_dpi": 150,
 	"output_dir": f"{OUTPUT_BASE_DIR}/{JOINT_PINN_CONFIG['run_name']}/test_on_galsim",
+	"eval_crop_border": 16,
 	"slurm_cpus_per_task": 8,
 	"slurm_time_limit": "04:00:00",
 }
@@ -413,6 +414,12 @@ RICHARDSON_LUCY_CONFIG: dict[str, object] = {
 	"frame_index": 0,
 	"clip": False,
 	"filter_epsilon": None,
+}
+
+
+WIENER_CONFIG: dict[str, object] = {
+	"psf_source": "truth",
+	"frame_index": 0,
 }
 
 

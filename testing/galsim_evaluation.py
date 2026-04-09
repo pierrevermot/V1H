@@ -746,6 +746,148 @@ class RichardsonLucyBackend(EvaluationBackend):
 		return {key: value.numpy().astype(np.float32) for key, value in result.items()}
 
 
+@register_backend("wiener")
+class WienerBackend(EvaluationBackend):
+	def __init__(
+		self,
+		*,
+		psf_source: str,
+		frame_index: int,
+		norm_psf,
+		norm_noise,
+		psf_denorm_factor: float,
+		noise_norm_factor: float,
+	):
+		self.psf_source = str(psf_source)
+		self.frame_index = int(frame_index)
+		self.norm_psf = norm_psf
+		self.norm_noise = norm_noise
+		self.psf_denorm_factor = float(psf_denorm_factor)
+		self.noise_norm_factor = float(noise_norm_factor)
+
+	@classmethod
+	def from_run(
+		cls,
+		*,
+		cfg,
+		run_dir: Path,
+		model_label: str,
+		preview_obs: tf.Tensor,
+	) -> "WienerBackend":
+		wiener_cfg = dict(getattr(cfg, "WIENER_CONFIG", {}))
+		dataset_cfg = dict(cfg.DATASET_LOAD_CONFIG)
+		preview_input_shape = tuple(int(v) for v in preview_obs.shape[1:])
+		n_pix_crop = int(preview_input_shape[0])
+		norm_psf = dataset_cfg.get("norm_psf")
+		norm_noise = dataset_cfg.get("norm_noise", dataset_cfg.get("norm_res"))
+		return cls(
+			psf_source=str(wiener_cfg.get("psf_source", "truth")),
+			frame_index=int(wiener_cfg.get("frame_index", 0)),
+			norm_psf=norm_psf,
+			norm_noise=norm_noise,
+			psf_denorm_factor=_compute_norm_factor(norm_psf, n_pix_crop),
+			noise_norm_factor=_compute_norm_factor(norm_noise, n_pix_crop),
+		)
+
+	def describe(self) -> dict[str, Any]:
+		return {
+			"backend": self.backend_name,
+			"psf_source": self.psf_source,
+			"frame_index": self.frame_index,
+		}
+
+	def _select_truth_frame(self, tensor: tf.Tensor) -> tf.Tensor:
+		channels = int(tensor.shape[-1])
+		if channels <= self.frame_index:
+			raise ValueError(
+				f"Requested frame_index={self.frame_index} but tensor only has {channels} channel(s)"
+			)
+		return tensor[..., self.frame_index : self.frame_index + 1]
+
+	def _select_psf_model(self, y_true: tf.Tensor) -> tf.Tensor:
+		if self.psf_source != "truth":
+			raise ValueError(f"Unsupported wiener psf_source={self.psf_source!r}")
+		_, truth_psf, _, _ = _split_truth(y_true)
+		return self._select_truth_frame(truth_psf)
+
+	def predict_batch(self, obs: tf.Tensor, y_true: tf.Tensor | None = None) -> tf.Tensor:
+		if y_true is None:
+			raise ValueError("wiener inference requires y_true to access the configured PSF model and noise map")
+		obs = tf.convert_to_tensor(obs, dtype=tf.float32)
+		y_true = tf.convert_to_tensor(y_true, dtype=tf.float32)
+		psf_model = tf.convert_to_tensor(self._select_psf_model(y_true), dtype=tf.float32)
+		obs_frame = tf.convert_to_tensor(self._select_truth_frame(obs), dtype=tf.float32)
+		_, _, truth_noise_all, _ = _split_truth(y_true)
+		noise_frame = self._select_truth_frame(truth_noise_all)
+
+		obs_np = np.asarray(obs_frame[..., 0], dtype=np.float32)
+		psf_np = np.asarray(psf_model[..., 0], dtype=np.float32)
+		noise_np = np.asarray(noise_frame[..., 0], dtype=np.float32)
+
+		pred_images: list[np.ndarray] = []
+		for example_index in range(obs_np.shape[0]):
+			obs_example = np.asarray(obs_np[example_index], dtype=np.float64)
+			psf_example = np.asarray(psf_np[example_index], dtype=np.float64)
+			noise_example = np.asarray(noise_np[example_index], dtype=np.float64)
+			psf_phys = psf_example / float(self.psf_denorm_factor)
+			psf_phys_t = tf.convert_to_tensor(psf_phys[None, ..., None], dtype=tf.float32)
+			psf_phys_norm, _, _ = _normalize_psf_for_observation(psf_phys_t)
+			psf_kernel = np.asarray(psf_phys_norm[0, ..., 0], dtype=np.float64)
+			noise_phys = noise_example / float(self.noise_norm_factor)
+			noise_variance = float(np.var(noise_phys))
+			psf_shifted = np.fft.ifftshift(psf_kernel)
+			obs_fft = np.fft.fft2(obs_example)
+			psf_fft = np.fft.fft2(psf_shifted)
+			img_fft = obs_fft * np.conj(psf_fft) / (np.abs(psf_fft) ** 2 + noise_variance)
+			pred_im = np.real(np.fft.ifft2(img_fft)).astype(np.float32)
+			pred_images.append(pred_im)
+
+		pred_im = np.stack(pred_images, axis=0)[..., None]
+		pred_psf = np.asarray(psf_model, dtype=np.float32)
+		pred_psf_phys = tf.convert_to_tensor(pred_psf / float(self.psf_denorm_factor), dtype=tf.float32)
+		pred_psf_phys, _, _ = _normalize_psf_for_observation(pred_psf_phys)
+		pred_obs = _convolve_image_with_psfs(tf.convert_to_tensor(pred_im, dtype=tf.float32), pred_psf_phys)
+		pred_noise_phys = pred_obs - obs_frame
+		pred_noise = pred_noise_phys * float(self.noise_norm_factor)
+		return tf.concat(
+			[
+				tf.convert_to_tensor(pred_im, dtype=tf.float32),
+				tf.convert_to_tensor(pred_psf, dtype=tf.float32),
+				tf.convert_to_tensor(pred_noise, dtype=tf.float32),
+			],
+			axis=-1,
+		)
+
+	def evaluate_prediction_batch(
+		self,
+		obs: tf.Tensor,
+		y_true: tf.Tensor,
+		y_pred: tf.Tensor,
+	) -> dict[str, np.ndarray]:
+		_ = obs
+		y_true = tf.convert_to_tensor(y_true, dtype=tf.float32)
+		y_pred = tf.convert_to_tensor(y_pred, dtype=tf.float32)
+		truth_im, truth_psf_all, truth_noise_all, _ = _split_truth(y_true)
+		truth_psf = self._select_truth_frame(truth_psf_all)
+		truth_noise = self._select_truth_frame(truth_noise_all)
+		pred_im = y_pred[..., :1]
+		pred_psf = y_pred[..., 1:2]
+		pred_noise = y_pred[..., 2:3]
+		truth_all = _concat_components(truth_im, truth_psf, truth_noise)
+		pred_all = _concat_components(pred_im, pred_psf, pred_noise)
+		result = {
+			"mse": _per_example_mse(truth_all, pred_all),
+			"mse_im": _per_example_mse(truth_im, pred_im),
+			"mse_psf": _per_example_mse(truth_psf, pred_psf),
+			"mse_noise": _per_example_mse(truth_noise, pred_noise),
+			"r2": _per_example_r2(truth_all, pred_all),
+			"r2_im": _per_example_r2(truth_im, pred_im),
+			"r2_psf": _per_example_r2(truth_psf, pred_psf),
+			"r2_noise": _per_example_r2(truth_noise, pred_noise),
+		}
+		return {key: value.numpy().astype(np.float32) for key, value in result.items()}
+
+
 def _build_dataset_specs(cfg) -> list[DatasetSpec]:
 	dataset_root = Path(str(cfg.DATASET_LOAD_CONFIG["data_dir"])).expanduser().resolve()
 	galsim_root = Path(str(cfg.GALSIM_TEST_CONFIG["output_dir"])).expanduser().resolve()
@@ -938,18 +1080,27 @@ def _evaluate_saved_inference(
 	y_true: np.ndarray,
 	y_pred: np.ndarray,
 	batch_size: int,
+	crop_border: int = 0,
 ) -> dict[str, np.ndarray]:
 	metric_history: dict[str, list[np.ndarray]] = {}
 	n_examples = int(obs.shape[0])
 	if n_examples == 0:
 		raise ValueError("Saved inference artifact contains no examples")
 	resolved_batch_size = max(1, int(batch_size))
+	c = int(crop_border)
 	for start in range(0, n_examples, resolved_batch_size):
 		stop = min(start + resolved_batch_size, n_examples)
+		obs_batch = obs[start:stop]
+		y_true_batch = y_true[start:stop]
+		y_pred_batch = y_pred[start:stop]
+		if c > 0:
+			obs_batch = obs_batch[:, c:-c, c:-c, :]
+			y_true_batch = y_true_batch[:, c:-c, c:-c, :]
+			y_pred_batch = y_pred_batch[:, c:-c, c:-c, :]
 		batch_metrics = backend.evaluate_prediction_batch(
-			obs[start:stop],
-			y_true[start:stop],
-			y_pred[start:stop],
+			obs_batch,
+			y_true_batch,
+			y_pred_batch,
 		)
 		for name, values in batch_metrics.items():
 			metric_history.setdefault(name, []).append(np.asarray(values, dtype=np.float32).reshape(-1))
@@ -1026,6 +1177,8 @@ def run_analysis(
 	stats_examples: int,
 	analysis_batch_size: int,
 ) -> dict[str, Any]:
+	test_cfg = dict(getattr(cfg, "TEST_ON_GALSIM_CONFIG", {}))
+	crop_border = int(test_cfg.get("eval_crop_border", 16))
 	result_dir = _resolve_result_dir(output_dir, algorithm)
 	manifest_path = result_dir / "inference_manifest.json"
 	if not manifest_path.exists():
@@ -1073,6 +1226,7 @@ def run_analysis(
 			y_true=y_true,
 			y_pred=y_pred,
 			batch_size=analysis_batch_size,
+			crop_border=crop_border,
 		)
 		summary = _summarize_dataset(metrics)
 		all_metrics[dataset_name] = metrics
@@ -1210,6 +1364,23 @@ def _extract_prediction_plot_components(
 			"psf": np.asarray(pred_psf[0, ..., 0], dtype=np.float32),
 			"noise": np.asarray(pred_noise[0, ..., 0], dtype=np.float32),
 		}
+	if isinstance(backend, WienerBackend):
+		pred_im = y_pred_tensor[..., :1]
+		pred_psf = y_pred_tensor[..., 1:2]
+		pred_noise = y_pred_tensor[..., 2:3]
+		pred_obs = _reconstruct_observation_from_prediction(
+			pred_im=pred_im,
+			pred_psf=pred_psf,
+			pred_noise=pred_noise,
+			psf_denorm_factor=backend.psf_denorm_factor,
+			noise_norm_factor=backend.noise_norm_factor,
+		)
+		return {
+			"obs": np.asarray(pred_obs[0, ..., 0], dtype=np.float32),
+			"im": np.asarray(pred_im[0, ..., 0], dtype=np.float32),
+			"psf": np.asarray(pred_psf[0, ..., 0], dtype=np.float32),
+			"noise": np.asarray(pred_noise[0, ..., 0], dtype=np.float32),
+		}
 	raise TypeError(f"Unsupported plotting backend type: {type(backend).__name__}")
 
 
@@ -1221,6 +1392,7 @@ def _plot_algorithm_comparison_example(
 	truth: dict[str, np.ndarray],
 	joint: dict[str, np.ndarray],
 	rl: dict[str, np.ndarray],
+	wiener: dict[str, np.ndarray],
 	out_path: Path,
 	dpi: int,
 ) -> None:
@@ -1242,6 +1414,7 @@ def _plot_algorithm_comparison_example(
 	}
 	res_joint = {name: truth[name] - joint[name] for name in component_order}
 	res_rl = {name: truth[name] - rl[name] for name in component_order}
+	res_wiener = {name: truth[name] - wiener[name] for name in component_order}
 
 	def _shared_power_norm(*arrays: np.ndarray):
 		flat = np.concatenate([np.ravel(np.asarray(arr, dtype=np.float64)) for arr in arrays])
@@ -1268,13 +1441,13 @@ def _plot_algorithm_comparison_example(
 		return Normalize(vmin=-half_range, vmax=half_range)
 
 	norms = {
-		"obs": _shared_power_norm(truth["obs"], joint["obs"], rl["obs"]),
-		"im": _shared_power_norm(truth["im"], joint["im"], rl["im"]),
-		"psf": _shared_power_norm(truth["psf"], joint["psf"], rl["psf"]),
-		"noise": _linear_norm([truth["noise"], joint["noise"], rl["noise"]], symmetric=True),
+		"obs": _shared_power_norm(truth["obs"], joint["obs"], rl["obs"], wiener["obs"]),
+		"im": _shared_power_norm(truth["im"], joint["im"], rl["im"], wiener["im"]),
+		"psf": _shared_power_norm(truth["psf"], joint["psf"], rl["psf"], wiener["psf"]),
+		"noise": _linear_norm([truth["noise"], joint["noise"], rl["noise"], wiener["noise"]], symmetric=True),
 	}
 	residual_norms = {
-		name: _sigma_clipped_symmetric_norm(res_joint[name], res_rl[name]) for name in component_order
+		name: _sigma_clipped_symmetric_norm(res_joint[name], res_rl[name], res_wiener[name]) for name in component_order
 	}
 	rows = [
 		("Ground truth", truth, norms, "viridis"),
@@ -1282,8 +1455,10 @@ def _plot_algorithm_comparison_example(
 		("Joint residual", res_joint, residual_norms, "coolwarm"),
 		("Richardson-Lucy", rl, norms, "viridis"),
 		("RL residual", res_rl, residual_norms, "coolwarm"),
+		("Wiener", wiener, norms, "viridis"),
+		("Wiener residual", res_wiener, residual_norms, "coolwarm"),
 	]
-	fig, axes = plt.subplots(len(rows), len(component_order), figsize=(15.5, 18.5), squeeze=False)
+	fig, axes = plt.subplots(len(rows), len(component_order), figsize=(15.5, 25.5), squeeze=False)
 	for row_index, (row_label, row_values, row_norms, cmap) in enumerate(rows):
 		for col_index, component_name in enumerate(component_order):
 			ax = axes[row_index, col_index]
@@ -1332,6 +1507,7 @@ def _plot_metric_comparison_histogram(
 	colors = {
 		"joint_pinn": "tab:green",
 		"richardson_lucy": "tab:red",
+		"wiener": "tab:purple",
 	}
 	for algorithm_name, values in sorted(finite_series.items()):
 		clipped_values = values[(values >= vmin) & (values <= vmax)]
@@ -1476,6 +1652,7 @@ def _plot_parameter_median_bars(
 	colors = {
 		"joint_pinn": "tab:green",
 		"richardson_lucy": "tab:red",
+		"wiener": "tab:purple",
 	}
 	for label_index, label in enumerate(labels):
 		values = np.asarray(series[label], dtype=np.float32).reshape(-1)
@@ -1515,10 +1692,12 @@ def run_plotting(
 	plot_examples: int,
 	plot_dpi: int,
 ) -> dict[str, Any]:
-	algorithms = ("joint_pinn", "richardson_lucy")
+	algorithms = ("joint_pinn", "richardson_lucy", "wiener")
 	plot_root = output_dir / "plots"
 	galsim_root = Path(str(cfg.GALSIM_TEST_CONFIG["output_dir"])).expanduser().resolve()
 	frame_index = int(dict(getattr(cfg, "RICHARDSON_LUCY_CONFIG", {})).get("frame_index", 0))
+	test_cfg = dict(getattr(cfg, "TEST_ON_GALSIM_CONFIG", {}))
+	crop_border = int(test_cfg.get("eval_crop_border", 16))
 	loaded_artifacts: dict[str, dict[str, dict[str, np.ndarray]]] = {}
 	loaded_metrics: dict[str, dict[str, dict[str, np.ndarray]]] = {}
 	backends: dict[str, EvaluationBackend] = {}
@@ -1550,9 +1729,11 @@ def run_plotting(
 	for dataset_name in ("val", "galsim"):
 		joint_artifact = loaded_artifacts["joint_pinn"][dataset_name]
 		rl_artifact = loaded_artifacts["richardson_lucy"][dataset_name]
+		wiener_artifact = loaded_artifacts["wiener"][dataset_name]
 		available_examples = min(
 			int(joint_artifact["obs"].shape[0]),
 			int(rl_artifact["obs"].shape[0]),
+			int(wiener_artifact["obs"].shape[0]),
 			int(plot_examples),
 		)
 		example_counts[dataset_name] = available_examples
@@ -1564,8 +1745,20 @@ def run_plotting(
 		rl_obs = rl_artifact["obs"][:available_examples]
 		rl_truth = rl_artifact["y_true"][:available_examples]
 		rl_pred = rl_artifact["y_pred"][:available_examples]
-		if not np.allclose(joint_obs, rl_obs, rtol=1e-4, atol=1e-5):
-			print(f"[test_on_galsim step4] Warning: obs arrays differ between algorithms for dataset={dataset_name}")
+		wiener_obs = wiener_artifact["obs"][:available_examples]
+		wiener_truth = wiener_artifact["y_true"][:available_examples]
+		wiener_pred = wiener_artifact["y_pred"][:available_examples]
+		if crop_border > 0:
+			c = crop_border
+			joint_obs = joint_obs[:, c:-c, c:-c, :]
+			joint_truth = joint_truth[:, c:-c, c:-c, :]
+			joint_pred = joint_pred[:, c:-c, c:-c, :]
+			rl_obs = rl_obs[:, c:-c, c:-c, :]
+			rl_truth = rl_truth[:, c:-c, c:-c, :]
+			rl_pred = rl_pred[:, c:-c, c:-c, :]
+			wiener_obs = wiener_obs[:, c:-c, c:-c, :]
+			wiener_truth = wiener_truth[:, c:-c, c:-c, :]
+			wiener_pred = wiener_pred[:, c:-c, c:-c, :]
 		for example_index in range(available_examples):
 			truth_components = _extract_truth_plot_components(
 				obs=joint_obs[example_index],
@@ -1584,6 +1777,12 @@ def run_plotting(
 				y_pred=rl_pred[example_index],
 				frame_index=frame_index,
 			)
+			wiener_components = _extract_prediction_plot_components(
+				backend=backends["wiener"],
+				y_true=wiener_truth[example_index],
+				y_pred=wiener_pred[example_index],
+				frame_index=frame_index,
+			)
 			out_path = plot_root / "examples" / dataset_name / f"example_{example_index:04d}.png"
 			_plot_algorithm_comparison_example(
 				dataset_name=dataset_name,
@@ -1592,6 +1791,7 @@ def run_plotting(
 				truth=truth_components,
 				joint=joint_components,
 				rl=rl_components,
+				wiener=wiener_components,
 				out_path=out_path,
 				dpi=plot_dpi,
 			)
@@ -1623,13 +1823,12 @@ def run_plotting(
 	comparison_histogram_counts: dict[str, int] = {"val": 0, "galsim": 0}
 	for dataset_name in ("val", "galsim"):
 		common_metric_names = sorted(
-			set(loaded_metrics["joint_pinn"].get(dataset_name, {}))
-			& set(loaded_metrics["richardson_lucy"].get(dataset_name, {}))
+			set.intersection(*(set(loaded_metrics[alg].get(dataset_name, {})) for alg in algorithms))
 		)
 		for metric_name in common_metric_names:
 			series = {
-				"joint_pinn": loaded_metrics["joint_pinn"][dataset_name][metric_name],
-				"richardson_lucy": loaded_metrics["richardson_lucy"][dataset_name][metric_name],
+				alg: loaded_metrics[alg][dataset_name][metric_name]
+				for alg in algorithms
 			}
 			out_path = plot_root / "histograms_compare_algorithms" / dataset_name / f"{_sanitize_filename(metric_name)}.png"
 			_plot_metric_comparison_histogram(
@@ -1672,13 +1871,12 @@ def run_plotting(
 				parameter_bar_counts[algorithm] += 1
 
 	common_galsim_metrics = sorted(
-		set(loaded_metrics["joint_pinn"].get("galsim", {})) & set(loaded_metrics["richardson_lucy"].get("galsim", {}))
+		set.intersection(*(set(loaded_metrics[alg].get("galsim", {})) for alg in algorithms))
 	)
 	if common_galsim_metrics and galsim_entries:
 		n_examples_common = min(
 			len(galsim_entries),
-			min(len(loaded_metrics["joint_pinn"]["galsim"][name]) for name in common_galsim_metrics),
-			min(len(loaded_metrics["richardson_lucy"]["galsim"][name]) for name in common_galsim_metrics),
+			*(min(len(loaded_metrics[alg]["galsim"][name]) for name in common_galsim_metrics) for alg in algorithms),
 		)
 		parameter_arrays_common = {
 			name: np.asarray([entry.get(name, np.nan) for entry in galsim_entries[:n_examples_common]], dtype=np.float32)
@@ -1697,8 +1895,8 @@ def run_plotting(
 					metric_name=metric_name,
 					parameter_values=parameter_values,
 					series={
-						"joint_pinn": loaded_metrics["joint_pinn"]["galsim"][metric_name][:n_examples_common],
-						"richardson_lucy": loaded_metrics["richardson_lucy"]["galsim"][metric_name][:n_examples_common],
+						alg: loaded_metrics[alg]["galsim"][metric_name][:n_examples_common]
+						for alg in algorithms
 					},
 					out_path=out_path,
 					dpi=plot_dpi,
@@ -1728,6 +1926,7 @@ __all__ = [
 	"DatasetSpec",
 	"EvaluationBackend",
 	"JointPinnBackend",
+	"WienerBackend",
 	"_resolve_runtime_options",
 	"run_analysis",
 	"run_inference",
