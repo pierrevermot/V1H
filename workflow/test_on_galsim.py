@@ -29,6 +29,7 @@ from utils.model_io import (
 	_load_independent_head_model,
 	_load_stage2_head_model,
 	_load_weights_into_rebuilt_model,
+	_resolve_model_paths,
 	_resolve_joint_model_paths,
 )
 from utils.normalization import _normalize_psf_for_observation
@@ -73,6 +74,69 @@ class EvaluationBackend:
 
 	def describe(self) -> dict[str, Any]:
 		return {"backend": self.backend_name}
+
+
+def _build_joint_training_cfg_from_experiment_config(cfg, *, run_dir: Path, model_label: str) -> dict[str, Any]:
+	output_base_dir = Path(cfg.OUTPUT_BASE_DIR).expanduser().resolve()
+	joint_config = dict(cfg.JOINT_PINN_CONFIG)
+	loss_config = dict(cfg.LOSS_CONFIG)
+	dataset_config = dict(cfg.DATASET_LOAD_CONFIG)
+
+	image_run_dir = output_base_dir / str(cfg.IMAGE_HEAD_CONFIG.get("run_name", "image_only"))
+	noise_run_dir = output_base_dir / str(cfg.NOISE_HEAD_CONFIG.get("run_name", "noise_only"))
+	psf_mean_run_dir = output_base_dir / str(cfg.PSF_HEAD_CONFIG.get("run_name", "psf_only"))
+	psf_unc_run_dir = output_base_dir / str(cfg.PSF_UNC_CONFIG.get("run_name", "psf_uncertainty_stage2"))
+
+	image_model_path = _resolve_model_paths(image_run_dir)[model_label]
+	noise_model_path = _resolve_model_paths(noise_run_dir)[model_label]
+	psf_mean_model_path = _resolve_model_paths(psf_mean_run_dir)[model_label]
+	psf_unc_model_path = _resolve_model_paths(psf_unc_run_dir)[model_label]
+	joint_model_path = _resolve_joint_model_paths(run_dir, {})[model_label]
+
+	return {
+		"run": str(joint_config.get("run_name", run_dir.name)),
+		"workflow": "joint_pinn_fourhead_training",
+		"dataset": dataset_config,
+		"loss": {
+			"type": "weighted_supervised_nll_plus_pinn_r2",
+			"log_sigma": bool(loss_config.get("log_sigma", False)),
+			"log_min": float(loss_config.get("log_min", -6.0)),
+			"log_max": float(loss_config.get("log_max", 20.0)),
+			"sigma2_eps": float(loss_config.get("sigma2_eps", 1e-12)),
+			"weights": {
+				"pinn": float(joint_config.get("pinn_weight", 1.0)),
+				"im": float(joint_config.get("im_weight", 1.0)),
+				"psf": float(joint_config.get("psf_weight", 1.0)),
+				"noise": float(joint_config.get("noise_weight", 1.0)),
+			},
+			"reconstruction_crop": int(joint_config.get("reconstruction_crop", 16)),
+		},
+		"training": {
+			"checkpoint_path": str(joint_model_path),
+		},
+		"source_models": {
+			"image": {
+				"model_path": str(image_model_path),
+				"run_dir": str(image_run_dir),
+				"model_label": model_label,
+			},
+			"noise": {
+				"model_path": str(noise_model_path),
+				"run_dir": str(noise_run_dir),
+				"model_label": model_label,
+			},
+			"psf_mean": {
+				"model_path": str(psf_mean_model_path),
+				"run_dir": str(psf_mean_run_dir),
+				"model_label": model_label,
+			},
+			"psf_unc": {
+				"model_path": str(psf_unc_model_path),
+				"run_dir": str(psf_unc_run_dir),
+				"model_label": model_label,
+			},
+		},
+	}
 
 
 def _per_example_mean(x: tf.Tensor) -> tf.Tensor:
@@ -183,7 +247,11 @@ class JointPinnBackend(EvaluationBackend):
 	) -> "JointPinnBackend":
 		training_cfg = _load_joint_run_config(run_dir)
 		if not training_cfg:
-			raise FileNotFoundError(f"Could not load joint training_config.json from {run_dir}")
+			training_cfg = _build_joint_training_cfg_from_experiment_config(
+				cfg,
+				run_dir=run_dir,
+				model_label=model_label,
+			)
 		joint_model_path = _resolve_joint_model_paths(run_dir, training_cfg)[model_label]
 
 		source_models = dict(training_cfg.get("source_models", {}))
