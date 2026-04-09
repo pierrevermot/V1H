@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
-"""Evaluate a deconvolution backend on val and GalSim datasets.
-
-The script is backend-driven so additional algorithms can be added later by
-registering a new EvaluationBackend subclass.
-"""
+"""Shared inference and analysis logic for GalSim evaluation workflows."""
 
 from __future__ import annotations
 
-import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,18 +18,18 @@ if str(ROOT_DIR) not in sys.path:
 
 from configs.load_config import load_experiment_config
 from neural_networks.dataset import make_dataset
+from neural_networks.losses import _convolve_image_with_psfs
 from utils.io import _load_joint_run_config
 from utils.metrics import _pred_to_sigma2, _split_pred, _split_truth
 from utils.model_io import (
 	_load_independent_head_model,
 	_load_stage2_head_model,
 	_load_weights_into_rebuilt_model,
-	_resolve_model_paths,
 	_resolve_joint_model_paths,
+	_resolve_model_paths,
 )
 from utils.normalization import _normalize_psf_for_observation
 from workflow.joint_pinn_fourhead_training import FourHeadJointPinnModel
-from neural_networks.losses import _convolve_image_with_psfs
 
 
 BACKEND_REGISTRY: dict[str, type["EvaluationBackend"]] = {}
@@ -69,8 +64,20 @@ class EvaluationBackend:
 	) -> "EvaluationBackend":
 		raise NotImplementedError
 
-	def evaluate_batch(self, obs: tf.Tensor, y_true: tf.Tensor) -> dict[str, np.ndarray]:
+	def predict_batch(self, obs: tf.Tensor) -> tf.Tensor:
 		raise NotImplementedError
+
+	def evaluate_prediction_batch(
+		self,
+		obs: tf.Tensor,
+		y_true: tf.Tensor,
+		y_pred: tf.Tensor,
+	) -> dict[str, np.ndarray]:
+		raise NotImplementedError
+
+	def evaluate_batch(self, obs: tf.Tensor, y_true: tf.Tensor) -> dict[str, np.ndarray]:
+		y_pred = self.predict_batch(obs)
+		return self.evaluate_prediction_batch(obs, y_true, y_pred)
 
 	def describe(self) -> dict[str, Any]:
 		return {"backend": self.backend_name}
@@ -421,6 +428,10 @@ class JointPinnBackend(EvaluationBackend):
 			"model_path": str(self.model_path),
 		}
 
+	def predict_batch(self, obs: tf.Tensor) -> tf.Tensor:
+		obs = tf.convert_to_tensor(obs, dtype=tf.float32)
+		return tf.convert_to_tensor(self.model(obs, training=False), dtype=tf.float32)
+
 	def _per_example_pinn_r2(
 		self,
 		obs: tf.Tensor,
@@ -471,10 +482,15 @@ class JointPinnBackend(EvaluationBackend):
 		)
 		return pred_obs, sigma2_obs
 
-	def evaluate_batch(self, obs: tf.Tensor, y_true: tf.Tensor) -> dict[str, np.ndarray]:
+	def evaluate_prediction_batch(
+		self,
+		obs: tf.Tensor,
+		y_true: tf.Tensor,
+		y_pred: tf.Tensor,
+	) -> dict[str, np.ndarray]:
 		obs = tf.convert_to_tensor(obs, dtype=tf.float32)
 		y_true = tf.convert_to_tensor(y_true, dtype=tf.float32)
-		y_pred = tf.convert_to_tensor(self.model(obs, training=False), dtype=tf.float32)
+		y_pred = tf.convert_to_tensor(y_pred, dtype=tf.float32)
 
 		truth_im, truth_psf, truth_noise, n_frames = _split_truth(y_true)
 		main_channels = 1 + 2 * n_frames
@@ -571,23 +587,6 @@ class JointPinnBackend(EvaluationBackend):
 		return {key: value.numpy().astype(np.float32) for key, value in result.items()}
 
 
-def _parse_args() -> argparse.Namespace:
-	parser = argparse.ArgumentParser(description="Evaluate a trained model on val and GalSim datasets.")
-	parser.add_argument("--config", type=Path, required=True, help="Path to experiment config .py file")
-	parser.add_argument("--algorithm", type=str, default=None, help="Evaluation backend name")
-	parser.add_argument("--run-dir", type=Path, default=None, help="Override trained model run directory")
-	parser.add_argument("--model-label", choices=("best_model", "final_model"), default=None)
-	parser.add_argument("--output-dir", type=Path, default=None)
-	parser.add_argument("--eval-batch-size", type=int, default=None)
-	parser.add_argument(
-		"--stats-examples",
-		type=int,
-		default=None,
-		help="Number of examples per dataset to use for startup component statistics (0 disables)",
-	)
-	return parser.parse_args()
-
-
 def _build_dataset_specs(cfg) -> list[DatasetSpec]:
 	dataset_root = Path(str(cfg.DATASET_LOAD_CONFIG["data_dir"])).expanduser().resolve()
 	galsim_root = Path(str(cfg.GALSIM_TEST_CONFIG["output_dir"])).expanduser().resolve()
@@ -668,36 +667,145 @@ def _print_startup_dataset_diagnostics(
 		)
 
 
-def main() -> None:
-	args = _parse_args()
-	cfg = load_experiment_config(args.config)
+def _summarize_artifact_components(
+	*,
+	obs: np.ndarray,
+	y_true: np.ndarray,
+	max_examples: int,
+) -> tuple[dict[str, dict[str, float]], int]:
+	if max_examples <= 0:
+		return {}, 0
+	if obs.shape[0] == 0 or y_true.shape[0] == 0:
+		return {}, 0
+	take = min(int(max_examples), int(obs.shape[0]), int(y_true.shape[0]))
+	obs_slice = tf.convert_to_tensor(obs[:take], dtype=tf.float32)
+	y_true_slice = tf.convert_to_tensor(y_true[:take], dtype=tf.float32)
+	truth_im, truth_psf, truth_noise, _ = _split_truth(y_true_slice)
+	return {
+		"obs": _summarize_basic_stats(np.asarray(obs_slice, dtype=np.float32).reshape(-1)),
+		"image": _summarize_basic_stats(np.asarray(truth_im, dtype=np.float32).reshape(-1)),
+		"psf": _summarize_basic_stats(np.asarray(truth_psf, dtype=np.float32).reshape(-1)),
+		"noise": _summarize_basic_stats(np.asarray(truth_noise, dtype=np.float32).reshape(-1)),
+	}, take
+
+
+def _resolve_result_dir(output_dir: Path, algorithm: str) -> Path:
+	return output_dir / "results" / algorithm
+
+
+def _resolve_runtime_options(
+	cfg,
+	*,
+	algorithm: str | None = None,
+	run_dir: Path | None = None,
+	model_label: str | None = None,
+	output_dir: Path | None = None,
+	eval_batch_size: int | None = None,
+	stats_examples: int | None = None,
+	first_batch_only: bool | None = None,
+) -> dict[str, Any]:
 	test_cfg = dict(getattr(cfg, "TEST_ON_GALSIM_CONFIG", {}))
-	algorithm = str(args.algorithm or test_cfg.get("algorithm", "joint_pinn"))
-	if algorithm not in BACKEND_REGISTRY:
-		raise ValueError(f"Unknown algorithm backend {algorithm!r}; available={tuple(sorted(BACKEND_REGISTRY))}")
-
+	resolved_algorithm = str(algorithm or test_cfg.get("algorithm", "joint_pinn"))
+	if resolved_algorithm not in BACKEND_REGISTRY:
+		raise ValueError(
+			f"Unknown algorithm backend {resolved_algorithm!r}; available={tuple(sorted(BACKEND_REGISTRY))}"
+		)
 	run_name = str(test_cfg.get("run_name", cfg.JOINT_PINN_CONFIG.get("run_name", "joint_pinn_fourhead")))
-	run_dir = args.run_dir.expanduser().resolve() if args.run_dir is not None else (Path(cfg.OUTPUT_BASE_DIR) / run_name).resolve()
-	model_label = str(args.model_label or test_cfg.get("model_label", "best_model"))
-	eval_batch_size = int(args.eval_batch_size or test_cfg.get("eval_batch_size", cfg.DATASET_LOAD_CONFIG.get("val_batch_size", 64)))
-	first_batch_only = bool(test_cfg.get("first_batch_only", True))
-	max_eval_batches = 1 if first_batch_only else None
-	stats_examples_value = args.stats_examples
-	if stats_examples_value is None:
-		stats_examples_value = test_cfg.get("stats_examples", min(eval_batch_size, 128))
-	stats_examples = int(stats_examples_value)
-	output_dir = args.output_dir.expanduser().resolve() if args.output_dir is not None else Path(str(test_cfg.get("output_dir", run_dir / "test_on_galsim"))).expanduser().resolve()
-	output_dir.mkdir(parents=True, exist_ok=True)
-	if first_batch_only:
-		print("[test_on_galsim] first_batch_only=True, limiting evaluation to the first batch of each dataset")
+	resolved_run_dir = run_dir.expanduser().resolve() if run_dir is not None else (Path(cfg.OUTPUT_BASE_DIR) / run_name).resolve()
+	resolved_model_label = str(model_label or test_cfg.get("model_label", "best_model"))
+	resolved_eval_batch_size = int(
+		eval_batch_size or test_cfg.get("eval_batch_size", cfg.DATASET_LOAD_CONFIG.get("val_batch_size", 64))
+	)
+	resolved_first_batch_only = bool(test_cfg.get("first_batch_only", True)) if first_batch_only is None else bool(first_batch_only)
+	resolved_stats_examples = stats_examples
+	if resolved_stats_examples is None:
+		resolved_stats_examples = test_cfg.get("stats_examples", min(resolved_eval_batch_size, 128))
+	resolved_output_dir = (
+		output_dir.expanduser().resolve()
+		if output_dir is not None
+		else Path(str(test_cfg.get("output_dir", resolved_run_dir / "test_on_galsim"))).expanduser().resolve()
+	)
+	return {
+		"algorithm": resolved_algorithm,
+		"run_dir": resolved_run_dir,
+		"model_label": resolved_model_label,
+		"eval_batch_size": resolved_eval_batch_size,
+		"first_batch_only": resolved_first_batch_only,
+		"max_eval_batches": 1 if resolved_first_batch_only else None,
+		"stats_examples": int(resolved_stats_examples),
+		"output_dir": resolved_output_dir,
+	}
 
+
+def _infer_dataset(
+	backend: EvaluationBackend,
+	dataset: tf.data.Dataset,
+	*,
+	max_batches: int | None,
+) -> tuple[dict[str, np.ndarray], int]:
+	obs_chunks: list[np.ndarray] = []
+	y_true_chunks: list[np.ndarray] = []
+	y_pred_chunks: list[np.ndarray] = []
+	batches_used = 0
+	for batch_index, (obs_batch, y_true_batch) in enumerate(dataset):
+		if max_batches is not None and batch_index >= max_batches:
+			break
+		obs_tensor = tf.convert_to_tensor(obs_batch, dtype=tf.float32)
+		y_true_tensor = tf.convert_to_tensor(y_true_batch, dtype=tf.float32)
+		y_pred_tensor = tf.convert_to_tensor(backend.predict_batch(obs_tensor), dtype=tf.float32)
+		obs_chunks.append(np.asarray(obs_tensor, dtype=np.float32))
+		y_true_chunks.append(np.asarray(y_true_tensor, dtype=np.float32))
+		y_pred_chunks.append(np.asarray(y_pred_tensor, dtype=np.float32))
+		batches_used += 1
+	if not obs_chunks:
+		raise ValueError("Dataset inference produced no batches")
+	return {
+		"obs": np.concatenate(obs_chunks, axis=0),
+		"y_true": np.concatenate(y_true_chunks, axis=0),
+		"y_pred": np.concatenate(y_pred_chunks, axis=0),
+	}, batches_used
+
+
+def _evaluate_saved_inference(
+	backend: EvaluationBackend,
+	*,
+	obs: np.ndarray,
+	y_true: np.ndarray,
+	y_pred: np.ndarray,
+	batch_size: int,
+) -> dict[str, np.ndarray]:
+	metric_history: dict[str, list[np.ndarray]] = {}
+	n_examples = int(obs.shape[0])
+	if n_examples == 0:
+		raise ValueError("Saved inference artifact contains no examples")
+	resolved_batch_size = max(1, int(batch_size))
+	for start in range(0, n_examples, resolved_batch_size):
+		stop = min(start + resolved_batch_size, n_examples)
+		batch_metrics = backend.evaluate_prediction_batch(
+			obs[start:stop],
+			y_true[start:stop],
+			y_pred[start:stop],
+		)
+		for name, values in batch_metrics.items():
+			metric_history.setdefault(name, []).append(np.asarray(values, dtype=np.float32).reshape(-1))
+	return {name: np.concatenate(chunks, axis=0) for name, chunks in metric_history.items()}
+
+
+def run_inference(
+	*,
+	cfg,
+	algorithm: str,
+	run_dir: Path,
+	model_label: str,
+	output_dir: Path,
+	eval_batch_size: int,
+	first_batch_only: bool,
+) -> dict[str, Any]:
+	output_dir.mkdir(parents=True, exist_ok=True)
+	result_dir = _resolve_result_dir(output_dir, algorithm)
+	result_dir.mkdir(parents=True, exist_ok=True)
 	dataset_specs = _build_dataset_specs(cfg)
 	datasets = {spec.name: _make_eval_dataset(cfg, spec.path, batch_size=eval_batch_size) for spec in dataset_specs}
-	_print_startup_dataset_diagnostics(
-		dataset_specs=dataset_specs,
-		datasets=datasets,
-		stats_examples=stats_examples,
-	)
 	preview_obs, _ = next(iter(datasets["val"].take(1)))
 	backend = BACKEND_REGISTRY[algorithm].from_run(
 		cfg=cfg,
@@ -705,55 +813,150 @@ def main() -> None:
 		model_label=model_label,
 		preview_obs=preview_obs,
 	)
-
-	all_metrics: dict[str, dict[str, np.ndarray]] = {}
-	all_summaries: dict[str, dict[str, dict[str, float]]] = {}
-	batches_evaluated: dict[str, int] = {}
+	manifest = {
+		"algorithm": algorithm,
+		"backend": backend.describe(),
+		"run_dir": str(run_dir),
+		"model_label": model_label,
+		"eval_batch_size": int(eval_batch_size),
+		"first_batch_only": bool(first_batch_only),
+		"datasets": {},
+	}
+	max_eval_batches = 1 if first_batch_only else None
+	if first_batch_only:
+		print("[test_on_galsim step2a] first_batch_only=True, limiting inference to the first batch of each dataset")
 	for spec in dataset_specs:
-		print(f"[test_on_galsim] Evaluating {spec.name} dataset from {spec.path}")
-		metrics, n_batches_used = _evaluate_dataset(
+		print(f"[test_on_galsim step2a] Running inference for {spec.name} dataset from {spec.path}")
+		artifact, n_batches_used = _infer_dataset(
 			backend,
 			datasets[spec.name],
 			max_batches=max_eval_batches,
 		)
-		summary = _summarize_dataset(metrics)
-		all_metrics[spec.name] = metrics
-		all_summaries[spec.name] = summary
-		batches_evaluated[spec.name] = n_batches_used
-		np.savez_compressed(output_dir / f"metrics_{spec.name}.npz", **metrics)
-		if first_batch_only:
-			print(f"[test_on_galsim] Used first {n_batches_used} batch for {spec.name}")
-		print(_render_summary_table(f"Summary for {spec.name}", summary))
+		artifact_label = "eval" if spec.name == "val" else spec.name
+		artifact_name = f"inference_{artifact_label}.npz"
+		np.savez_compressed(result_dir / artifact_name, **artifact)
+		manifest["datasets"][spec.name] = {
+			"dataset_path": str(spec.path),
+			"artifact_path": artifact_name,
+			"batches_evaluated": int(n_batches_used),
+			"n_examples": int(artifact["obs"].shape[0]),
+		}
+		print(
+			f"[test_on_galsim step2a] Saved {spec.name} inference to {result_dir / artifact_name} "
+			f"({artifact['obs'].shape[0]} examples, {n_batches_used} batches)"
+		)
+	with (result_dir / "inference_manifest.json").open("w", encoding="utf-8") as handle:
+		json.dump(manifest, handle, indent=2)
+	print(f"[test_on_galsim step2a] Wrote inference manifest to: {result_dir / 'inference_manifest.json'}")
+	return manifest
 
+
+def run_analysis(
+	*,
+	cfg,
+	algorithm: str,
+	run_dir: Path,
+	model_label: str,
+	output_dir: Path,
+	stats_examples: int,
+	analysis_batch_size: int,
+) -> dict[str, Any]:
+	result_dir = _resolve_result_dir(output_dir, algorithm)
+	manifest_path = result_dir / "inference_manifest.json"
+	if not manifest_path.exists():
+		raise FileNotFoundError(f"Inference manifest not found: {manifest_path}")
+	with manifest_path.open("r", encoding="utf-8") as handle:
+		manifest = json.load(handle)
+	val_artifact_path = result_dir / str(manifest["datasets"]["val"]["artifact_path"])
+	with np.load(val_artifact_path) as val_data:
+		preview_obs = tf.convert_to_tensor(val_data["obs"][:1], dtype=tf.float32)
+	backend = BACKEND_REGISTRY[algorithm].from_run(
+		cfg=cfg,
+		run_dir=run_dir,
+		model_label=model_label,
+		preview_obs=preview_obs,
+	)
+	all_metrics: dict[str, dict[str, np.ndarray]] = {}
+	all_summaries: dict[str, dict[str, dict[str, float]]] = {}
+	component_summaries: dict[str, dict[str, dict[str, float]]] = {}
+	for dataset_name, dataset_info in manifest["datasets"].items():
+		artifact_path = result_dir / str(dataset_info["artifact_path"])
+		with np.load(artifact_path) as data:
+			obs = np.asarray(data["obs"], dtype=np.float32)
+			y_true = np.asarray(data["y_true"], dtype=np.float32)
+			y_pred = np.asarray(data["y_pred"], dtype=np.float32)
+		component_summary, used_examples = _summarize_artifact_components(
+			obs=obs,
+			y_true=y_true,
+			max_examples=stats_examples,
+		)
+		if component_summary:
+			component_summaries[dataset_name] = component_summary
+			print(
+				_render_component_stats_table(
+					(
+						f"Startup component stats for {dataset_name} "
+						f"(first {used_examples} saved examples from {dataset_info['dataset_path']})"
+					),
+					component_summary,
+				)
+			)
+		print(f"[test_on_galsim step3] Evaluating saved inference for {dataset_name} from {artifact_path}")
+		metrics = _evaluate_saved_inference(
+			backend,
+			obs=obs,
+			y_true=y_true,
+			y_pred=y_pred,
+			batch_size=analysis_batch_size,
+		)
+		summary = _summarize_dataset(metrics)
+		all_metrics[dataset_name] = metrics
+		all_summaries[dataset_name] = summary
+		np.savez_compressed(result_dir / f"metrics_{dataset_name}.npz", **metrics)
+		print(_render_summary_table(f"Summary for {dataset_name}", summary))
 	comparison_text = _render_comparison_table(
 		val_summary=all_summaries["val"],
 		galsim_summary=all_summaries["galsim"],
 	)
 	print(comparison_text)
-
 	report = {
 		"algorithm": algorithm,
 		"backend": backend.describe(),
 		"run_dir": str(run_dir),
 		"model_label": model_label,
-		"eval_batch_size": eval_batch_size,
-		"first_batch_only": first_batch_only,
-		"batches_evaluated": batches_evaluated,
-		"dataset_paths": {spec.name: str(spec.path) for spec in dataset_specs},
+		"eval_batch_size": int(manifest.get("eval_batch_size", analysis_batch_size)),
+		"analysis_batch_size": int(analysis_batch_size),
+		"first_batch_only": bool(manifest.get("first_batch_only", False)),
+		"datasets": manifest["datasets"],
+		"component_summaries": component_summaries,
 		"summaries": all_summaries,
 	}
-	with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
+	with (result_dir / "summary.json").open("w", encoding="utf-8") as handle:
 		json.dump(report, handle, indent=2)
-	with (output_dir / "report.txt").open("w", encoding="utf-8") as handle:
-		handle.write(_render_summary_table("Summary for val", all_summaries["val"]))
-		handle.write("\n\n")
-		handle.write(_render_summary_table("Summary for galsim", all_summaries["galsim"]))
-		handle.write("\n\n")
+	with (result_dir / "report.txt").open("w", encoding="utf-8") as handle:
+		for dataset_name in ("val", "galsim"):
+			if dataset_name in component_summaries:
+				handle.write(
+					_render_component_stats_table(
+						f"Startup component stats for {dataset_name}",
+						component_summaries[dataset_name],
+					)
+				)
+				handle.write("\n\n")
+			handle.write(_render_summary_table(f"Summary for {dataset_name}", all_summaries[dataset_name]))
+			handle.write("\n\n")
 		handle.write(comparison_text)
 		handle.write("\n")
+	print(f"[test_on_galsim step3] Wrote outputs to: {result_dir}")
+	return report
 
-	print(f"[test_on_galsim] Wrote outputs to: {output_dir}")
 
-
-if __name__ == "__main__":
-	main()
+__all__ = [
+	"BACKEND_REGISTRY",
+	"DatasetSpec",
+	"EvaluationBackend",
+	"JointPinnBackend",
+	"_resolve_runtime_options",
+	"run_analysis",
+	"run_inference",
+]

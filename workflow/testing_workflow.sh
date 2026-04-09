@@ -7,7 +7,8 @@
 #
 # Steps:
 #   1. Generate GalSim testing dataset (CPU)
-#   2. Evaluate model on val + GalSim (GPU)
+#   2a. Run inference on val + GalSim and save artifacts (GPU)
+#   3. Compute statistics and losses from saved inference artifacts (GPU)
 # ===========================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -181,14 +182,14 @@ echo "Step 1 (GalSim test dataset) : JobID=$JOB1"
 STEP2_DEPENDENCY_OPT=$(join_dependency_opt "$JOB1")
 
 # ===========================================================================
-# Step 2: Evaluate joint model on val + GalSim (GPU)
+# Step 2a: Run inference on val + GalSim (GPU)
 # ===========================================================================
-STEP2_SCRIPT="$LOG_DIR/testing_step2_eval_joint_on_galsim.sh"
-cat > "$STEP2_SCRIPT" <<SLURM_EOF
+STEP2A_SCRIPT="$LOG_DIR/testing_step2a_inference_joint_on_galsim.sh"
+cat > "$STEP2A_SCRIPT" <<SLURM_EOF
 #!/usr/bin/env bash
-#SBATCH --job-name=test_on_galsim
-#SBATCH --output=$LOG_DIR/testing_step2_%j.out
-#SBATCH --error=$LOG_DIR/testing_step2_%j.err
+#SBATCH --job-name=test_on_galsim_infer
+#SBATCH --output=$LOG_DIR/testing_step2a_%j.out
+#SBATCH --error=$LOG_DIR/testing_step2a_%j.err
 #SBATCH --account=$SLURM_GPU_ACCOUNT
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
@@ -205,17 +206,53 @@ module load $MODULE_TF
 export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
 cd "$ROOT_DIR"
 
-python3 -u workflow/test_on_galsim.py \
+python3 -u workflow/test_on_galsim_step2a_inference.py \
 	--config "$CONFIG"
 SLURM_EOF
-chmod +x "$STEP2_SCRIPT"
+chmod +x "$STEP2A_SCRIPT"
 
-JOB2=$(submit_job "$STEP2_SCRIPT")
-echo "Step 2 (evaluate val + GalSim): JobID=$JOB2"
+JOB2A=$(submit_job "$STEP2A_SCRIPT")
+echo "Step 2a (save val + GalSim inference): JobID=$JOB2A"
+
+STEP3_DEPENDENCY_OPT=$(join_dependency_opt "$JOB2A")
+
+# ===========================================================================
+# Step 3: Compute statistics and losses from saved inference (GPU)
+# ===========================================================================
+STEP3_SCRIPT="$LOG_DIR/testing_step3_analyze_joint_on_galsim.sh"
+cat > "$STEP3_SCRIPT" <<SLURM_EOF
+#!/usr/bin/env bash
+#SBATCH --job-name=test_on_galsim_analyze
+#SBATCH --output=$LOG_DIR/testing_step3_%j.out
+#SBATCH --error=$LOG_DIR/testing_step3_%j.err
+#SBATCH --account=$SLURM_GPU_ACCOUNT
+#SBATCH --qos=$QOS
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=$TEST_EVAL_CPUS
+#SBATCH --time=$TEST_EVAL_TIME
+#SBATCH --hint=nomultithread
+$GPU_CONSTRAINT
+$STEP3_DEPENDENCY_OPT
+$EXCLUDE_OPT
+
+module purge
+$ARCH_PREMODULE
+module load $MODULE_TF
+export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
+cd "$ROOT_DIR"
+
+python3 -u workflow/test_on_galsim_step3_analysis.py \
+	--config "$CONFIG"
+SLURM_EOF
+chmod +x "$STEP3_SCRIPT"
+
+JOB3=$(submit_job "$STEP3_SCRIPT")
+echo "Step 3 (analyze saved inference): JobID=$JOB3"
 
 echo ""
 echo "=========================================="
 echo "All jobs submitted. Testing pipeline:"
 echo "  Step 1 ($JOB1) -> GalSim test dataset generation"
-echo "  Step 1 ($JOB1) -> Step 2 ($JOB2) evaluate val + GalSim"
+echo "  Step 1 ($JOB1) -> Step 2a ($JOB2A) save val + GalSim inference"
+echo "  Step 2a ($JOB2A) -> Step 3 ($JOB3) compute statistics and losses"
 echo "=========================================="
