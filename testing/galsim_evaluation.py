@@ -1292,20 +1292,26 @@ def _plot_metric_histogram(
 	if not finite_series:
 		return
 	all_values = np.concatenate(list(finite_series.values()), axis=0)
-	vmin = float(np.min(all_values))
-	max_value = float(np.max(all_values))
+	vmin = float(np.percentile(all_values, 5.0))
+	max_value = float(np.percentile(all_values, 95.0))
 	if not np.isfinite(vmin) or not np.isfinite(max_value):
 		return
 	if vmin == max_value:
-		max_value = vmin + 1e-6
+		vmin = float(np.min(all_values))
+		max_value = float(np.max(all_values))
+		if vmin == max_value:
+			max_value = vmin + 1e-6
 	fig, ax = plt.subplots(figsize=(8.5, 5.0))
 	colors = {
 		"val": "tab:blue",
 		"galsim": "tab:orange",
 	}
 	for dataset_name, values in sorted(finite_series.items()):
+		clipped_values = values[(values >= vmin) & (values <= max_value)]
+		if clipped_values.size == 0:
+			continue
 		ax.hist(
-			values,
+			clipped_values,
 			bins=60,
 			range=(vmin, max_value),
 			alpha=0.45,
@@ -1316,6 +1322,7 @@ def _plot_metric_histogram(
 	ax.set_title(f"{algorithm}: {metric_name}")
 	ax.set_xlabel(metric_name)
 	ax.set_ylabel("Count")
+	ax.set_xlim(vmin, max_value)
 	ax.grid(True, alpha=0.25)
 	ax.legend()
 	fig.tight_layout()
