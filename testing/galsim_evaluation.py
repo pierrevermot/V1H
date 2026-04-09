@@ -1228,8 +1228,10 @@ def _plot_algorithm_comparison_example(
 
 	matplotlib.use("Agg")
 	import matplotlib.pyplot as plt
+	from astropy.stats import sigma_clipped_stats
 
-	from utils.plot_helpers import _imshow, _linear_norm, _power_norm
+	from utils.plot_helpers import _imshow, _linear_norm
+	from matplotlib.colors import PowerNorm
 
 	component_order = ("obs", "im", "psf", "noise")
 	component_titles = {
@@ -1240,14 +1242,39 @@ def _plot_algorithm_comparison_example(
 	}
 	res_joint = {name: truth[name] - joint[name] for name in component_order}
 	res_rl = {name: truth[name] - rl[name] for name in component_order}
+
+	def _shared_power_norm(*arrays: np.ndarray):
+		flat = np.concatenate([np.ravel(np.asarray(arr, dtype=np.float64)) for arr in arrays])
+		finite = flat[np.isfinite(flat)]
+		if finite.size == 0:
+			return PowerNorm(gamma=0.5, vmin=0.0, vmax=1.0)
+		vmin = float(np.min(finite))
+		vmax = float(np.max(finite))
+		if vmin == vmax:
+			vmax = vmin + 1e-6
+		return PowerNorm(gamma=0.5, vmin=vmin, vmax=vmax)
+
+	def _sigma_clipped_symmetric_norm(*arrays: np.ndarray):
+		flat = np.concatenate([np.ravel(np.asarray(arr, dtype=np.float64)) for arr in arrays])
+		finite = flat[np.isfinite(flat)]
+		if finite.size == 0:
+			return _linear_norm([np.asarray([0.0], dtype=np.float32)], symmetric=True)
+		_, _, std = sigma_clipped_stats(finite, sigma=3.0, maxiters=5)
+		if not np.isfinite(std) or std <= 0.0:
+			return _linear_norm([finite], symmetric=True)
+		half_range = max(float(3.0 * std), 1e-6)
+		from matplotlib.colors import Normalize
+
+		return Normalize(vmin=-half_range, vmax=half_range)
+
 	norms = {
-		"obs": _power_norm([truth["obs"], joint["obs"], rl["obs"]]),
-		"im": _power_norm([truth["im"], joint["im"], rl["im"]]),
-		"psf": _power_norm([truth["psf"], joint["psf"], rl["psf"]]),
+		"obs": _shared_power_norm(truth["obs"], joint["obs"], rl["obs"]),
+		"im": _shared_power_norm(truth["im"], joint["im"], rl["im"]),
+		"psf": _shared_power_norm(truth["psf"], joint["psf"], rl["psf"]),
 		"noise": _linear_norm([truth["noise"], joint["noise"], rl["noise"]], symmetric=True),
 	}
 	residual_norms = {
-		name: _linear_norm([res_joint[name], res_rl[name]], symmetric=True) for name in component_order
+		name: _sigma_clipped_symmetric_norm(res_joint[name], res_rl[name]) for name in component_order
 	}
 	rows = [
 		("Ground truth", truth, norms, "viridis"),
@@ -1266,6 +1293,66 @@ def _plot_algorithm_comparison_example(
 				ax.set_ylabel(row_label, fontsize=11)
 	fig.suptitle(f"{dataset_name} example {example_index} (frame {frame_index})", fontsize=14)
 	fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.98))
+	out_path.parent.mkdir(parents=True, exist_ok=True)
+	fig.savefig(out_path, dpi=dpi)
+	plt.close(fig)
+
+
+def _plot_metric_comparison_histogram(
+	*,
+	dataset_name: str,
+	metric_name: str,
+	series: dict[str, np.ndarray],
+	out_path: Path,
+	dpi: int,
+) -> None:
+	import matplotlib
+
+	matplotlib.use("Agg")
+	import matplotlib.pyplot as plt
+
+	finite_series = {
+		name: np.asarray(values, dtype=np.float32).reshape(-1)[np.isfinite(np.asarray(values, dtype=np.float32).reshape(-1))]
+		for name, values in series.items()
+	}
+	finite_series = {name: values for name, values in finite_series.items() if values.size > 0}
+	if not finite_series:
+		return
+	all_values = np.concatenate(list(finite_series.values()), axis=0)
+	vmin = float(np.percentile(all_values, 5.0))
+	vmax = float(np.percentile(all_values, 95.0))
+	if not np.isfinite(vmin) or not np.isfinite(vmax):
+		return
+	if vmin == vmax:
+		vmin = float(np.min(all_values))
+		vmax = float(np.max(all_values))
+		if vmin == vmax:
+			vmax = vmin + 1e-6
+	fig, ax = plt.subplots(figsize=(8.5, 5.0))
+	colors = {
+		"joint_pinn": "tab:green",
+		"richardson_lucy": "tab:red",
+	}
+	for algorithm_name, values in sorted(finite_series.items()):
+		clipped_values = values[(values >= vmin) & (values <= vmax)]
+		if clipped_values.size == 0:
+			continue
+		ax.hist(
+			clipped_values,
+			bins=60,
+			range=(vmin, vmax),
+			alpha=0.45,
+			label=algorithm_name,
+			color=colors.get(algorithm_name, None),
+			edgecolor="none",
+		)
+	ax.set_title(f"{dataset_name}: {metric_name}")
+	ax.set_xlabel(metric_name)
+	ax.set_ylabel("Count")
+	ax.set_xlim(vmin, vmax)
+	ax.grid(True, alpha=0.25)
+	ax.legend()
+	fig.tight_layout()
 	out_path.parent.mkdir(parents=True, exist_ok=True)
 	fig.savefig(out_path, dpi=dpi)
 	plt.close(fig)
@@ -1459,6 +1546,27 @@ def run_plotting(
 			)
 			histogram_counts[algorithm] += 1
 
+	comparison_histogram_counts: dict[str, int] = {"val": 0, "galsim": 0}
+	for dataset_name in ("val", "galsim"):
+		common_metric_names = sorted(
+			set(loaded_metrics["joint_pinn"].get(dataset_name, {}))
+			& set(loaded_metrics["richardson_lucy"].get(dataset_name, {}))
+		)
+		for metric_name in common_metric_names:
+			series = {
+				"joint_pinn": loaded_metrics["joint_pinn"][dataset_name][metric_name],
+				"richardson_lucy": loaded_metrics["richardson_lucy"][dataset_name][metric_name],
+			}
+			out_path = plot_root / "histograms_compare_algorithms" / dataset_name / f"{_sanitize_filename(metric_name)}.png"
+			_plot_metric_comparison_histogram(
+				dataset_name=dataset_name,
+				metric_name=metric_name,
+				series=series,
+				out_path=out_path,
+				dpi=plot_dpi,
+			)
+			comparison_histogram_counts[dataset_name] += 1
+
 	report = {
 		"plot_root": str(plot_root),
 		"frame_index": frame_index,
@@ -1466,6 +1574,7 @@ def run_plotting(
 		"plot_dpi": int(plot_dpi),
 		"example_counts": example_counts,
 		"histogram_counts": histogram_counts,
+		"comparison_histogram_counts": comparison_histogram_counts,
 	}
 	plot_root.mkdir(parents=True, exist_ok=True)
 	with (plot_root / "plot_report.json").open("w", encoding="utf-8") as handle:
