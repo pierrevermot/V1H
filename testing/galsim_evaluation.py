@@ -1434,6 +1434,78 @@ def _load_saved_metrics(result_dir: Path, dataset_name: str) -> dict[str, np.nda
 		return {key: np.asarray(data[key], dtype=np.float32) for key in data.files}
 
 
+def _load_generation_parameter_log(galsim_root: Path) -> dict[str, Any]:
+	log_path = galsim_root / "generation_parameter_log.json"
+	if not log_path.exists():
+		raise FileNotFoundError(f"Generation parameter log not found: {log_path}")
+	with log_path.open("r", encoding="utf-8") as handle:
+		return json.load(handle)
+
+
+def _format_parameter_value(value: float) -> str:
+	return f"{float(value):.3g}"
+
+
+def _plot_parameter_median_bars(
+	*,
+	parameter_name: str,
+	metric_name: str,
+	parameter_values: np.ndarray,
+	series: dict[str, np.ndarray],
+	out_path: Path,
+	dpi: int,
+) -> None:
+	import matplotlib
+
+	matplotlib.use("Agg")
+	import matplotlib.pyplot as plt
+
+	parameter_values = np.asarray(parameter_values, dtype=np.float32).reshape(-1)
+	finite_params = parameter_values[np.isfinite(parameter_values)]
+	if finite_params.size == 0:
+		return
+	levels = np.unique(finite_params)
+	if levels.size == 0:
+		return
+	labels = [name for name, values in series.items() if np.asarray(values, dtype=np.float32).size > 0]
+	if not labels:
+		return
+	x = np.arange(levels.size, dtype=np.float32)
+	bar_width = 0.8 / max(len(labels), 1)
+	fig, ax = plt.subplots(figsize=(max(9.0, 1.2 * levels.size), 5.0))
+	colors = {
+		"joint_pinn": "tab:green",
+		"richardson_lucy": "tab:red",
+	}
+	for label_index, label in enumerate(labels):
+		values = np.asarray(series[label], dtype=np.float32).reshape(-1)
+		limit = min(parameter_values.size, values.size)
+		if limit <= 0:
+			continue
+		param_slice = parameter_values[:limit]
+		value_slice = values[:limit]
+		medians: list[float] = []
+		for level in levels:
+			mask = np.isfinite(param_slice) & np.isfinite(value_slice) & np.isclose(param_slice, level, rtol=1e-6, atol=1e-8)
+			if not np.any(mask):
+				medians.append(np.nan)
+			else:
+				medians.append(float(np.median(value_slice[mask])))
+		offset = (label_index - (len(labels) - 1) / 2.0) * bar_width
+		ax.bar(x + offset, medians, width=bar_width, label=label, color=colors.get(label, None), alpha=0.85)
+	ax.set_title(f"Median {metric_name} vs {parameter_name}")
+	ax.set_xlabel(parameter_name)
+	ax.set_ylabel(f"Median {metric_name}")
+	ax.set_xticks(x)
+	ax.set_xticklabels([_format_parameter_value(level) for level in levels], rotation=45, ha="right")
+	ax.grid(True, axis="y", alpha=0.25)
+	ax.legend()
+	fig.tight_layout()
+	out_path.parent.mkdir(parents=True, exist_ok=True)
+	fig.savefig(out_path, dpi=dpi)
+	plt.close(fig)
+
+
 def run_plotting(
 	*,
 	cfg,
@@ -1445,10 +1517,12 @@ def run_plotting(
 ) -> dict[str, Any]:
 	algorithms = ("joint_pinn", "richardson_lucy")
 	plot_root = output_dir / "plots"
+	galsim_root = Path(str(cfg.GALSIM_TEST_CONFIG["output_dir"])).expanduser().resolve()
 	frame_index = int(dict(getattr(cfg, "RICHARDSON_LUCY_CONFIG", {})).get("frame_index", 0))
 	loaded_artifacts: dict[str, dict[str, dict[str, np.ndarray]]] = {}
 	loaded_metrics: dict[str, dict[str, dict[str, np.ndarray]]] = {}
 	backends: dict[str, EvaluationBackend] = {}
+	generation_log = _load_generation_parameter_log(galsim_root)
 	for algorithm in algorithms:
 		result_dir = _resolve_result_dir(output_dir, algorithm)
 		manifest_path = result_dir / "inference_manifest.json"
@@ -1567,6 +1641,70 @@ def run_plotting(
 			)
 			comparison_histogram_counts[dataset_name] += 1
 
+	parameter_bar_counts: dict[str, int] = {algorithm: 0 for algorithm in algorithms}
+	comparison_parameter_bar_counts = 0
+	galsim_entries = list(generation_log.get("per_example", []))
+	parameter_names = ("noise_sigma", "psf_residual_wavefront_rms_waves")
+	for algorithm in algorithms:
+		galsim_metrics = loaded_metrics[algorithm].get("galsim", {})
+		if not galsim_metrics:
+			continue
+		n_examples = min(len(galsim_entries), min(len(values) for values in galsim_metrics.values()))
+		if n_examples <= 0:
+			continue
+		parameter_arrays = {
+			name: np.asarray([entry.get(name, np.nan) for entry in galsim_entries[:n_examples]], dtype=np.float32)
+			for name in parameter_names
+		}
+		for parameter_name, parameter_values in parameter_arrays.items():
+			for metric_name, metric_values in galsim_metrics.items():
+				out_path = (
+					plot_root / "parameter_bars" / algorithm / parameter_name / f"{_sanitize_filename(metric_name)}.png"
+				)
+				_plot_parameter_median_bars(
+					parameter_name=parameter_name,
+					metric_name=metric_name,
+					parameter_values=parameter_values,
+					series={algorithm: metric_values[:n_examples]},
+					out_path=out_path,
+					dpi=plot_dpi,
+				)
+				parameter_bar_counts[algorithm] += 1
+
+	common_galsim_metrics = sorted(
+		set(loaded_metrics["joint_pinn"].get("galsim", {})) & set(loaded_metrics["richardson_lucy"].get("galsim", {}))
+	)
+	if common_galsim_metrics and galsim_entries:
+		n_examples_common = min(
+			len(galsim_entries),
+			min(len(loaded_metrics["joint_pinn"]["galsim"][name]) for name in common_galsim_metrics),
+			min(len(loaded_metrics["richardson_lucy"]["galsim"][name]) for name in common_galsim_metrics),
+		)
+		parameter_arrays_common = {
+			name: np.asarray([entry.get(name, np.nan) for entry in galsim_entries[:n_examples_common]], dtype=np.float32)
+			for name in parameter_names
+		}
+		for parameter_name, parameter_values in parameter_arrays_common.items():
+			for metric_name in common_galsim_metrics:
+				out_path = (
+					plot_root
+					/ "parameter_bars_compare_algorithms"
+					/ parameter_name
+					/ f"{_sanitize_filename(metric_name)}.png"
+				)
+				_plot_parameter_median_bars(
+					parameter_name=parameter_name,
+					metric_name=metric_name,
+					parameter_values=parameter_values,
+					series={
+						"joint_pinn": loaded_metrics["joint_pinn"]["galsim"][metric_name][:n_examples_common],
+						"richardson_lucy": loaded_metrics["richardson_lucy"]["galsim"][metric_name][:n_examples_common],
+					},
+					out_path=out_path,
+					dpi=plot_dpi,
+				)
+				comparison_parameter_bar_counts += 1
+
 	report = {
 		"plot_root": str(plot_root),
 		"frame_index": frame_index,
@@ -1575,6 +1713,8 @@ def run_plotting(
 		"example_counts": example_counts,
 		"histogram_counts": histogram_counts,
 		"comparison_histogram_counts": comparison_histogram_counts,
+		"parameter_bar_counts": parameter_bar_counts,
+		"comparison_parameter_bar_counts": comparison_parameter_bar_counts,
 	}
 	plot_root.mkdir(parents=True, exist_ok=True)
 	with (plot_root / "plot_report.json").open("w", encoding="utf-8") as handle:

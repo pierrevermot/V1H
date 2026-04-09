@@ -56,6 +56,7 @@ OBSCURATION_FRAC = CENTRAL_OBSCURATION_M / DIAM_M
 NOISE_SIGMAS = np.geomspace(0.5, 24.0, N_NOISE).astype(float)
 EXAMPLE_STAT_COMPONENTS = ("image", "obs", "psf", "noise", "ref_psf")
 DEFAULT_TFRECORD_NAME = "batch_0000.tfrecord"
+DEFAULT_GENERATION_LOG_NAME = "generation_parameter_log.json"
 SCENE_CONFIG: dict[str, Any] = {
     "primary_sersic_n_range": [0.8, 4.5],
     "primary_half_light_radius_arcsec_range": [0.08, 0.28],
@@ -148,7 +149,7 @@ def _configure_from_experiment_config(cfg) -> dict[str, Any]:
     else:
         noise_sigma_min = float(galsim_cfg.get("noise_sigma_min", 0.5))
         noise_sigma_max = float(galsim_cfg.get("noise_sigma_max", 24.0))
-        noise_sigmas = np.geomspace(noise_sigma_min, noise_sigma_max, N_NOISE).astype(float)
+        noise_sigmas = np.linspace(noise_sigma_min, noise_sigma_max, N_NOISE).astype(float)
 
     if noise_sigmas.ndim != 1 or len(noise_sigmas) != N_NOISE:
         raise ValueError(
@@ -430,18 +431,27 @@ def make_psf(psf_id: int, rng: np.random.Generator) -> tuple[galsim.GSObject, di
         metadata = {
             "psf_id": psf_id,
             "type": "Airy",
+            "aberration_sampling": "linear_template",
+            "aberration_amplitude_scale": 0.0,
+            "residual_wavefront_rms_waves": 0.0,
             **common,
         }
         return psf, metadata
 
     # Keep aberrations small to mimic high-Strehl, low-perturbation AO PSFs.
-    # The scale increases mildly across the 9 aberrated PSFs.
+    # The residual-wavefront RMS increases linearly across the aberrated PSFs.
     amp_min, amp_max = _range_pair(PSF_CONFIG, "aberration_amplitude_range")
     amp = np.linspace(amp_min, amp_max, N_PSFS - 1)[psf_id - 1]
-    coeffs = {
-        name: rng.normal(0.0, float(scale) * amp)
-        for name, scale in dict(PSF_CONFIG["aberration_scales"]).items()
-    }
+    aberration_scales = dict(PSF_CONFIG["aberration_scales"])
+    mode_names = list(aberration_scales)
+    mode_weights = np.asarray([float(aberration_scales[name]) for name in mode_names], dtype=np.float64)
+    mode_signs = np.asarray([1.0 if index % 2 == 0 else -1.0 for index in range(len(mode_names))], dtype=np.float64)
+    rms_norm = float(np.sqrt(np.mean(np.square(mode_weights))))
+    if not np.isfinite(rms_norm) or rms_norm <= 0.0:
+        rms_norm = 1.0
+    coeff_vector = amp * mode_signs * mode_weights / rms_norm
+    coeffs = {name: float(coeff_vector[index]) for index, name in enumerate(mode_names)}
+    residual_wavefront_rms_waves = float(np.sqrt(np.mean(np.square(coeff_vector))))
 
     psf = galsim.OpticalPSF(
         lam=LAM_NM,
@@ -457,11 +467,64 @@ def make_psf(psf_id: int, rng: np.random.Generator) -> tuple[galsim.GSObject, di
     metadata = {
         "psf_id": psf_id,
         "type": "OpticalPSF",
+        "aberration_sampling": "linear_template",
         "aberration_amplitude_scale": amp,
+        "residual_wavefront_rms_waves": residual_wavefront_rms_waves,
+        "aberration_mode_names": mode_names,
+        "aberration_mode_template_weights": mode_weights.tolist(),
+        "aberration_mode_template_signs": mode_signs.tolist(),
         **common,
         **coeffs,
     }
     return psf, metadata
+
+
+def _build_generation_parameter_log(metadata: dict[str, Any]) -> dict[str, Any]:
+    scene_metadata = list(metadata.get("scene_metadata", []))
+    psf_metadata = list(metadata.get("psf_metadata", []))
+    noise_sigmas = np.asarray(metadata.get("noise_model", {}).get("sigmas", NOISE_SIGMAS), dtype=np.float64)
+
+    per_example: list[dict[str, Any]] = []
+    for scene_id, _scene_meta in enumerate(scene_metadata):
+        for psf_id, psf_meta in enumerate(psf_metadata):
+            for noise_level_id, noise_sigma in enumerate(noise_sigmas):
+                per_example.append(
+                    {
+                        "example_index": len(per_example),
+                        "scene_id": int(scene_id),
+                        "psf_id": int(psf_id),
+                        "noise_level_id": int(noise_level_id),
+                        "noise_sigma": float(noise_sigma),
+                        "psf_type": str(psf_meta.get("type", "unknown")),
+                        "psf_aberration_amplitude_scale": float(psf_meta.get("aberration_amplitude_scale", 0.0)),
+                        "psf_residual_wavefront_rms_waves": float(psf_meta.get("residual_wavefront_rms_waves", 0.0)),
+                    }
+                )
+
+    return {
+        "path": DEFAULT_GENERATION_LOG_NAME,
+        "sampling": {
+            "noise_sigma": "linear",
+            "psf_residual_wavefront": "linear_template",
+        },
+        "parameter_names": [
+            "noise_sigma",
+            "psf_aberration_amplitude_scale",
+            "psf_residual_wavefront_rms_waves",
+        ],
+        "n_examples": len(per_example),
+        "noise_levels": [float(value) for value in noise_sigmas.tolist()],
+        "psf_levels": [
+            {
+                "psf_id": int(item.get("psf_id", index)),
+                "psf_type": str(item.get("type", "unknown")),
+                "psf_aberration_amplitude_scale": float(item.get("aberration_amplitude_scale", 0.0)),
+                "psf_residual_wavefront_rms_waves": float(item.get("residual_wavefront_rms_waves", 0.0)),
+            }
+            for index, item in enumerate(psf_metadata)
+        ],
+        "per_example": per_example,
+    }
 
 
 def draw_stamp(obj: galsim.GSObject) -> galsim.Image:
@@ -855,6 +918,9 @@ def save_dataset(arrays: dict[str, np.ndarray], metadata: dict[str, Any], outdir
     np.savez_compressed(outdir / "dataset.npz", **arrays)
     with open(outdir / "metadata.json", "w", encoding="utf-8") as f:
         json.dump(_to_builtin(metadata), f, indent=2)
+    generation_log = _build_generation_parameter_log(metadata)
+    with open(outdir / DEFAULT_GENERATION_LOG_NAME, "w", encoding="utf-8") as f:
+        json.dump(_to_builtin(generation_log), f, indent=2)
 
 
 def main() -> None:
@@ -894,6 +960,13 @@ def main() -> None:
         "image_config": SCENE_CONFIG,
         "psf_config": PSF_CONFIG,
     }
+    metadata["generation_parameter_log"] = {
+        "path": DEFAULT_GENERATION_LOG_NAME,
+        "sampling": {
+            "noise_sigma": "linear",
+            "psf_residual_wavefront": "linear_template",
+        },
+    }
     save_dataset(arrays, metadata, outdir=runtime_cfg["output_dir"])
 
     print(f"Saved dataset to: {runtime_cfg['output_dir'].resolve()}")
@@ -901,6 +974,7 @@ def main() -> None:
     for name, arr in arrays.items():
         print(f"  {name:12s} {arr.shape}")
     print("metadata.json contains the generation parameters and per-scene/per-PSF metadata.")
+    print(f"Generation parameter log written to: {(runtime_cfg['output_dir'] / DEFAULT_GENERATION_LOG_NAME).resolve()}")
     if runtime_cfg["write_tfrecords"]:
         n_frames_per_example = metadata["tfrecord_dataset"]["grouping"]["n_frames_per_example"]
         stats_path = metadata["tfrecord_dataset"]["statistics"]["path"]
