@@ -81,7 +81,7 @@ GALSIM_TEST_CPUS=$(read_config 'print(getattr(cfg, "GALSIM_TEST_CONFIG", {}).get
 GALSIM_TEST_TIME=$(read_config 'print(getattr(cfg, "GALSIM_TEST_CONFIG", {}).get("slurm_time_limit", "02:00:00"))') || exit 1
 GALSIM_TEST_OUTPUT_DIR=$(read_config 'print(getattr(cfg, "GALSIM_TEST_CONFIG", {}).get("output_dir", ""))') || exit 1
 TEST_EVAL_CPUS=$(read_config 'print(getattr(cfg, "TEST_ON_GALSIM_CONFIG", {}).get("slurm_cpus_per_task", cfg.SLURM_CONFIG.get("cpus_per_task", 24)))') || exit 1
-TEST_EVAL_TIME=$(read_config 'print(getattr(cfg, "TEST_ON_GALSIM_CONFIG", {}).get("slurm_time_limit", "04:00:00"))') || exit 1
+TEST_EVAL_TIME=$(read_config 'print(getattr(cfg, "TEST_ON_GALSIM_CONFIG", {}).get("slurm_time_limit", "02:00:00"))') || exit 1
 TEST_EVAL_OUTPUT_DIR=$(read_config 'print(getattr(cfg, "TEST_ON_GALSIM_CONFIG", {}).get("output_dir", ""))') || exit 1
 if [[ -z "$GALSIM_TEST_OUTPUT_DIR" ]]; then
 	GALSIM_TEST_OUTPUT_DIR="$DATASET_OUTPUT_DIR/galsim_test"
