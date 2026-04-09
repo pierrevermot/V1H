@@ -164,6 +164,27 @@ def _per_example_nll(truth: tf.Tensor, pred: tf.Tensor, sigma2: tf.Tensor) -> tu
 	return residual + logsigma2, residual, logsigma2
 
 
+def _per_example_weighted_residual(truth: tf.Tensor, pred: tf.Tensor, sigma2: tf.Tensor) -> tf.Tensor:
+	err2 = tf.square(pred - truth)
+	return _per_example_mean(err2 / sigma2)
+
+
+def _propagate_reconstructed_observation_sigma2(
+	*,
+	pred_im: tf.Tensor,
+	pred_psf_phys: tf.Tensor,
+	sigma2_im: tf.Tensor,
+	sigma2_psf_phys: tf.Tensor,
+	sigma2_noise_phys: tf.Tensor,
+	eps: float,
+) -> tf.Tensor:
+	term_im = _convolve_image_with_psfs(sigma2_im, tf.square(pred_psf_phys))
+	term_psf = _convolve_image_with_psfs(tf.square(pred_im), sigma2_psf_phys)
+	term_cross = _convolve_image_with_psfs(sigma2_im, sigma2_psf_phys)
+	sigma2_obs = term_im + term_psf + term_cross + sigma2_noise_phys
+	return tf.maximum(sigma2_obs, tf.cast(eps, sigma2_obs.dtype))
+
+
 def _concat_components(*arrays: tf.Tensor) -> tf.Tensor:
 	return tf.concat(list(arrays), axis=-1)
 
@@ -419,6 +440,37 @@ class JointPinnBackend(EvaluationBackend):
 			obs = obs[:, c:-c, c:-c, :]
 		return _per_example_mean(tf.square(pred_obs - obs)) / _per_example_variance(obs)
 
+	def _predicted_observation_and_sigma2(
+		self,
+		pred_im: tf.Tensor,
+		pred_psf: tf.Tensor,
+		pred_noise: tf.Tensor,
+		sigma2_im: tf.Tensor,
+		sigma2_psf: tf.Tensor,
+		sigma2_noise: tf.Tensor,
+	) -> tuple[tf.Tensor, tf.Tensor]:
+		psf_df = tf.cast(self.model._psf_denorm_factor, pred_psf.dtype)
+		noise_df = tf.cast(self.model._noise_denorm_factor, pred_noise.dtype)
+
+		pred_psf_phys = pred_psf / psf_df
+		sigma2_psf_phys = sigma2_psf / tf.square(psf_df)
+		pred_psf_phys, sigma2_psf_phys, _ = _normalize_psf_for_observation(
+			pred_psf_phys,
+			sigma2_psf=sigma2_psf_phys,
+		)
+		pred_noise_phys = pred_noise / noise_df
+		sigma2_noise_phys = sigma2_noise / tf.square(noise_df)
+		pred_obs = _convolve_image_with_psfs(pred_im, pred_psf_phys) - pred_noise_phys
+		sigma2_obs = _propagate_reconstructed_observation_sigma2(
+			pred_im=pred_im,
+			pred_psf_phys=pred_psf_phys,
+			sigma2_im=sigma2_im,
+			sigma2_psf_phys=sigma2_psf_phys,
+			sigma2_noise_phys=sigma2_noise_phys,
+			eps=self.model.sigma2_eps,
+		)
+		return pred_obs, sigma2_obs
+
 	def evaluate_batch(self, obs: tf.Tensor, y_true: tf.Tensor) -> dict[str, np.ndarray]:
 		obs = tf.convert_to_tensor(obs, dtype=tf.float32)
 		y_true = tf.convert_to_tensor(y_true, dtype=tf.float32)
@@ -472,12 +524,30 @@ class JointPinnBackend(EvaluationBackend):
 		r2 = _per_example_r2(truth_all, pred_all)
 		nll, _, _ = _per_example_nll(truth_all, pred_all, sigma2_all)
 		r2_pinn = self._per_example_pinn_r2(obs, pred_im, pred_psf, pred_noise)
+		pred_obs, sigma2_obs = self._predicted_observation_and_sigma2(
+			pred_im,
+			pred_psf,
+			pred_noise,
+			sigma2_im,
+			sigma2_psf,
+			sigma2_noise,
+		)
+		obs_for_pinn = obs
+		if self.model.reconstruction_crop > 0:
+			c = int(self.model.reconstruction_crop)
+			pred_obs = pred_obs[:, c:-c, c:-c, :]
+			sigma2_obs = sigma2_obs[:, c:-c, c:-c, :]
+			obs_for_pinn = obs_for_pinn[:, c:-c, c:-c, :]
+		pinn_loss_step4 = tf.cast(self.pinn_weight, r2_pinn.dtype) * r2_pinn
+		pinn_loss_unc = _per_example_weighted_residual(obs_for_pinn, pred_obs, sigma2_obs)
 		loss_supervised = self.im_weight * nll_im + self.psf_weight * nll_psf + self.noise_weight * nll_noise
 		loss = loss_supervised + self.pinn_weight * r2_pinn
 
 		result = {
 			"loss": loss,
 			"loss_supervised": loss_supervised,
+			"pinn_loss_step4": pinn_loss_step4,
+			"pinn_loss_unc": pinn_loss_unc,
 			"mse": mse,
 			"mse_im": mse_im,
 			"mse_psf": mse_psf,
