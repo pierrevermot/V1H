@@ -194,7 +194,6 @@ cat > "$STEP2A_SCRIPT" <<SLURM_EOF
 #SBATCH --output=$LOG_DIR/testing_step2a_%j.out
 #SBATCH --error=$LOG_DIR/testing_step2a_%j.err
 #SBATCH --account=$SLURM_GPU_ACCOUNT
-#SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=$TEST_EVAL_CPUS
 #SBATCH --time=$TEST_EVAL_TIME
