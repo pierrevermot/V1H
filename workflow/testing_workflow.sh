@@ -248,7 +248,7 @@ echo "Step 2b (save Richardson-Lucy inference): JobID=$JOB2B"
 STEP3_DEPENDENCY_OPT=$(join_dependency_opt "$JOB2A" "$JOB2B")
 
 # ===========================================================================
-# Step 3: Compute statistics and losses from saved inference (GPU)
+# Step 3: Compute statistics and losses from saved inference (CPU)
 # ===========================================================================
 STEP3_SCRIPT="$LOG_DIR/testing_step3_analyze_joint_on_galsim.sh"
 cat > "$STEP3_SCRIPT" <<SLURM_EOF
@@ -256,19 +256,15 @@ cat > "$STEP3_SCRIPT" <<SLURM_EOF
 #SBATCH --job-name=test_on_galsim_analyze
 #SBATCH --output=$LOG_DIR/testing_step3_%j.out
 #SBATCH --error=$LOG_DIR/testing_step3_%j.err
-#SBATCH --account=$SLURM_GPU_ACCOUNT
-#SBATCH --qos=$QOS
-#SBATCH --gres=gpu:1
+#SBATCH --account=$SLURM_CPU_ACCOUNT
 #SBATCH --cpus-per-task=$TEST_EVAL_CPUS
 #SBATCH --time=$TEST_EVAL_TIME
 #SBATCH --hint=nomultithread
-$GPU_CONSTRAINT
 $STEP3_DEPENDENCY_OPT
 $EXCLUDE_OPT
 
 module purge
-$ARCH_PREMODULE
-module load $MODULE_TF
+module load $CPU_MODULE_TF
 export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
 cd "$ROOT_DIR"
 
