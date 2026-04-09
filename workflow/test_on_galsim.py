@@ -179,6 +179,18 @@ def _summarize_metric(values: np.ndarray) -> dict[str, float]:
 	}
 
 
+def _summarize_basic_stats(values: np.ndarray) -> dict[str, float]:
+	flat = np.asarray(values, dtype=np.float64).reshape(-1)
+	return {
+		"min": float(np.min(flat)),
+		"max": float(np.max(flat)),
+		"mean": float(np.mean(flat)),
+		"median": float(np.median(flat)),
+		"std": float(np.std(flat)),
+		"sum": float(np.sum(flat)),
+	}
+
+
 def _render_summary_table(title: str, summary: dict[str, dict[str, float]]) -> str:
 	metric_width = max(len("metric"), *(len(name) for name in summary))
 	header = f"{'metric':<{metric_width}}  {'min':>12}  {'max':>12}  {'mean':>12}  {'median':>12}  {'std':>12}"
@@ -190,6 +202,67 @@ def _render_summary_table(title: str, summary: dict[str, dict[str, float]]) -> s
 			f"{stats['min']:>12.6g}  {stats['max']:>12.6g}  {stats['mean']:>12.6g}  {stats['median']:>12.6g}  {stats['std']:>12.6g}"
 		)
 	return "\n".join(lines)
+
+
+def _render_component_stats_table(title: str, summary: dict[str, dict[str, float]]) -> str:
+	metric_width = max(len("component"), *(len(name) for name in summary))
+	header = (
+		f"{'component':<{metric_width}}  {'min':>12}  {'max':>12}  {'mean':>12}  "
+		f"{'median':>12}  {'std':>12}  {'sum':>12}"
+	)
+	lines = [title, header, "-" * len(header)]
+	for component_name in sorted(summary):
+		stats = summary[component_name]
+		lines.append(
+			f"{component_name:<{metric_width}}  "
+			f"{stats['min']:>12.6g}  {stats['max']:>12.6g}  {stats['mean']:>12.6g}  "
+			f"{stats['median']:>12.6g}  {stats['std']:>12.6g}  {stats['sum']:>12.6g}"
+		)
+	return "\n".join(lines)
+
+
+def _summarize_dataset_components(
+	dataset: tf.data.Dataset,
+	*,
+	max_examples: int,
+) -> tuple[dict[str, dict[str, float]], int]:
+	if max_examples <= 0:
+		return {}, 0
+
+	component_chunks: dict[str, list[np.ndarray]] = {
+		"image": [],
+		"noise": [],
+		"obs": [],
+		"psf": [],
+	}
+	seen_examples = 0
+	for obs_batch, y_true_batch in dataset:
+		batch_size = int(obs_batch.shape[0])
+		if batch_size <= 0:
+			continue
+		remaining = max_examples - seen_examples
+		if remaining <= 0:
+			break
+		take = min(batch_size, remaining)
+		obs_slice = tf.convert_to_tensor(obs_batch[:take], dtype=tf.float32)
+		y_true_slice = tf.convert_to_tensor(y_true_batch[:take], dtype=tf.float32)
+		truth_im, truth_psf, truth_noise, _ = _split_truth(y_true_slice)
+		component_chunks["obs"].append(np.asarray(obs_slice, dtype=np.float32).reshape(-1))
+		component_chunks["image"].append(np.asarray(truth_im, dtype=np.float32).reshape(-1))
+		component_chunks["psf"].append(np.asarray(truth_psf, dtype=np.float32).reshape(-1))
+		component_chunks["noise"].append(np.asarray(truth_noise, dtype=np.float32).reshape(-1))
+		seen_examples += take
+		if seen_examples >= max_examples:
+			break
+
+	if seen_examples == 0:
+		return {}, 0
+
+	return {
+		name: _summarize_basic_stats(np.concatenate(chunks, axis=0))
+		for name, chunks in component_chunks.items()
+		if chunks
+	}, seen_examples
 
 
 def _render_comparison_table(
@@ -436,6 +509,12 @@ def _parse_args() -> argparse.Namespace:
 	parser.add_argument("--model-label", choices=("best_model", "final_model"), default=None)
 	parser.add_argument("--output-dir", type=Path, default=None)
 	parser.add_argument("--eval-batch-size", type=int, default=None)
+	parser.add_argument(
+		"--stats-examples",
+		type=int,
+		default=None,
+		help="Number of examples per dataset to use for startup component statistics (0 disables)",
+	)
 	return parser.parse_args()
 
 
@@ -483,6 +562,33 @@ def _summarize_dataset(metrics: dict[str, np.ndarray]) -> dict[str, dict[str, fl
 	return {name: _summarize_metric(values) for name, values in metrics.items()}
 
 
+def _print_startup_dataset_diagnostics(
+	*,
+	dataset_specs: list[DatasetSpec],
+	datasets: dict[str, tf.data.Dataset],
+	stats_examples: int,
+) -> None:
+	if stats_examples <= 0:
+		return
+	for spec in dataset_specs:
+		summary, used_examples = _summarize_dataset_components(
+			datasets[spec.name],
+			max_examples=stats_examples,
+		)
+		if not summary:
+			print(f"[test_on_galsim] No startup component statistics available for {spec.name}")
+			continue
+		print(
+			_render_component_stats_table(
+				(
+					f"Startup component stats for {spec.name} "
+					f"(first {used_examples} examples from {spec.path})"
+				),
+				summary,
+			)
+		)
+
+
 def main() -> None:
 	args = _parse_args()
 	cfg = load_experiment_config(args.config)
@@ -495,11 +601,20 @@ def main() -> None:
 	run_dir = args.run_dir.expanduser().resolve() if args.run_dir is not None else (Path(cfg.OUTPUT_BASE_DIR) / run_name).resolve()
 	model_label = str(args.model_label or test_cfg.get("model_label", "best_model"))
 	eval_batch_size = int(args.eval_batch_size or test_cfg.get("eval_batch_size", cfg.DATASET_LOAD_CONFIG.get("val_batch_size", 64)))
+	stats_examples_value = args.stats_examples
+	if stats_examples_value is None:
+		stats_examples_value = test_cfg.get("stats_examples", min(eval_batch_size, 128))
+	stats_examples = int(stats_examples_value)
 	output_dir = args.output_dir.expanduser().resolve() if args.output_dir is not None else Path(str(test_cfg.get("output_dir", run_dir / "test_on_galsim"))).expanduser().resolve()
 	output_dir.mkdir(parents=True, exist_ok=True)
 
 	dataset_specs = _build_dataset_specs(cfg)
 	datasets = {spec.name: _make_eval_dataset(cfg, spec.path, batch_size=eval_batch_size) for spec in dataset_specs}
+	_print_startup_dataset_diagnostics(
+		dataset_specs=dataset_specs,
+		datasets=datasets,
+		stats_examples=stats_examples,
+	)
 	preview_obs, _ = next(iter(datasets["val"].take(1)))
 	backend = BACKEND_REGISTRY[algorithm].from_run(
 		cfg=cfg,
