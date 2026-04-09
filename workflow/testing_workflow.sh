@@ -10,6 +10,7 @@
 #   2a. Run joint PINN inference on val + GalSim and save artifacts (GPU)
 #   2b. Run Richardson-Lucy inference on val + GalSim and save artifacts (CPU)
 #   3. Compute statistics and losses from saved inference artifacts for all algorithms (GPU)
+#   4. Generate comparison figures and histograms from saved artifacts (CPU)
 # ===========================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -284,6 +285,37 @@ chmod +x "$STEP3_SCRIPT"
 JOB3=$(submit_job "$STEP3_SCRIPT")
 echo "Step 3 (analyze saved inference for all algorithms): JobID=$JOB3"
 
+STEP4_DEPENDENCY_OPT=$(join_dependency_opt "$JOB3")
+
+# ===========================================================================
+# Step 4: Generate plots from saved inference + metrics (CPU)
+# ===========================================================================
+STEP4_SCRIPT="$LOG_DIR/testing_step4_plot_on_galsim.sh"
+cat > "$STEP4_SCRIPT" <<SLURM_EOF
+#!/usr/bin/env bash
+#SBATCH --job-name=test_on_galsim_plot
+#SBATCH --output=$LOG_DIR/testing_step4_%j.out
+#SBATCH --error=$LOG_DIR/testing_step4_%j.err
+#SBATCH --account=$SLURM_CPU_ACCOUNT
+#SBATCH --cpus-per-task=$TEST_EVAL_CPUS
+#SBATCH --time=$TEST_EVAL_TIME
+#SBATCH --hint=nomultithread
+$STEP4_DEPENDENCY_OPT
+$EXCLUDE_OPT
+
+module purge
+module load $CPU_MODULE_TF
+export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
+cd "$ROOT_DIR"
+
+python3 -u workflow/test_on_galsim_step4_plot.py \
+	--config "$CONFIG"
+SLURM_EOF
+chmod +x "$STEP4_SCRIPT"
+
+JOB4=$(submit_job "$STEP4_SCRIPT")
+echo "Step 4 (generate plots and histograms): JobID=$JOB4"
+
 echo ""
 echo "=========================================="
 echo "All jobs submitted. Testing pipeline:"
@@ -291,4 +323,5 @@ echo "  Step 1 ($JOB1) -> GalSim test dataset generation"
 echo "  Step 1 ($JOB1) -> Step 2a ($JOB2A) save val + GalSim inference"
 echo "  Step 1 ($JOB1) -> Step 2b ($JOB2B) save Richardson-Lucy inference"
 echo "  Step 2a ($JOB2A), Step 2b ($JOB2B) -> Step 3 ($JOB3) compute statistics and losses"
+echo "  Step 3 ($JOB3) -> Step 4 ($JOB4) generate figures and histograms"
 echo "=========================================="

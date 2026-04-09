@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 import sys
@@ -861,6 +862,8 @@ def _resolve_runtime_options(
 	eval_batch_size: int | None = None,
 	stats_examples: int | None = None,
 	first_batch_only: bool | None = None,
+	plot_examples: int | None = None,
+	plot_dpi: int | None = None,
 ) -> dict[str, Any]:
 	test_cfg = dict(getattr(cfg, "TEST_ON_GALSIM_CONFIG", {}))
 	resolved_algorithm = str(algorithm or test_cfg.get("algorithm", "joint_pinn"))
@@ -878,6 +881,8 @@ def _resolve_runtime_options(
 	resolved_stats_examples = stats_examples
 	if resolved_stats_examples is None:
 		resolved_stats_examples = test_cfg.get("stats_examples", min(resolved_eval_batch_size, 128))
+	resolved_plot_examples = int(plot_examples if plot_examples is not None else test_cfg.get("plot_examples", 12))
+	resolved_plot_dpi = int(plot_dpi if plot_dpi is not None else test_cfg.get("plot_dpi", 150))
 	resolved_output_dir = (
 		output_dir.expanduser().resolve()
 		if output_dir is not None
@@ -891,6 +896,8 @@ def _resolve_runtime_options(
 		"first_batch_only": resolved_first_batch_only,
 		"max_eval_batches": 1 if resolved_first_batch_only else None,
 		"stats_examples": int(resolved_stats_examples),
+		"plot_examples": resolved_plot_examples,
+		"plot_dpi": resolved_plot_dpi,
 		"output_dir": resolved_output_dir,
 	}
 
@@ -1109,6 +1116,357 @@ def run_analysis(
 	return report
 
 
+def _sanitize_filename(value: str) -> str:
+	cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+	return cleaned.strip("._") or "metric"
+
+
+def _select_channel(image: np.ndarray, frame_index: int) -> np.ndarray:
+	array = np.asarray(image, dtype=np.float32)
+	if array.ndim == 2:
+		return array
+	if array.ndim != 3:
+		raise ValueError(f"Expected 2D or 3D array, got shape={array.shape}")
+	if array.shape[-1] == 1:
+		return array[..., 0]
+	if frame_index < 0 or frame_index >= array.shape[-1]:
+		raise ValueError(f"Requested frame_index={frame_index} but available channels={array.shape[-1]}")
+	return array[..., frame_index]
+
+
+def _extract_truth_plot_components(
+	*,
+	obs: np.ndarray,
+	y_true: np.ndarray,
+	frame_index: int,
+) -> dict[str, np.ndarray]:
+	obs_tensor = tf.convert_to_tensor(obs[None, ...], dtype=tf.float32)
+	y_true_tensor = tf.convert_to_tensor(y_true[None, ...], dtype=tf.float32)
+	truth_im, truth_psf, truth_noise, _ = _split_truth(y_true_tensor)
+	return {
+		"obs": _select_channel(np.asarray(obs_tensor[0], dtype=np.float32), frame_index),
+		"im": np.asarray(truth_im[0, ..., 0], dtype=np.float32),
+		"psf": _select_channel(np.asarray(truth_psf[0], dtype=np.float32), frame_index),
+		"noise": _select_channel(np.asarray(truth_noise[0], dtype=np.float32), frame_index),
+	}
+
+
+def _reconstruct_observation_from_prediction(
+	*,
+	pred_im: tf.Tensor,
+	pred_psf: tf.Tensor,
+	pred_noise: tf.Tensor,
+	psf_denorm_factor: float,
+	noise_norm_factor: float,
+) -> tf.Tensor:
+	pred_psf_phys = pred_psf / tf.cast(psf_denorm_factor, pred_psf.dtype)
+	pred_psf_phys, _, _ = _normalize_psf_for_observation(pred_psf_phys)
+	pred_noise_phys = pred_noise / tf.cast(noise_norm_factor, pred_noise.dtype)
+	return _convolve_image_with_psfs(pred_im, pred_psf_phys) - pred_noise_phys
+
+
+def _extract_prediction_plot_components(
+	*,
+	backend: EvaluationBackend,
+	y_true: np.ndarray,
+	y_pred: np.ndarray,
+	frame_index: int,
+) -> dict[str, np.ndarray]:
+	y_true_tensor = tf.convert_to_tensor(y_true[None, ...], dtype=tf.float32)
+	y_pred_tensor = tf.convert_to_tensor(y_pred[None, ...], dtype=tf.float32)
+	if isinstance(backend, JointPinnBackend):
+		_, _, _, n_frames = _split_truth(y_true_tensor)
+		n_frames = int(n_frames)
+		main_channels = 1 + 2 * n_frames
+		pred_main = y_pred_tensor[..., :main_channels]
+		pred_im, pred_psf, pred_noise = _split_pred(pred_main, n_frames)
+		pred_obs = _reconstruct_observation_from_prediction(
+			pred_im=pred_im,
+			pred_psf=pred_psf,
+			pred_noise=pred_noise,
+			psf_denorm_factor=float(backend.model._psf_denorm_factor),
+			noise_norm_factor=float(backend.model._noise_denorm_factor),
+		)
+		return {
+			"obs": _select_channel(np.asarray(pred_obs[0], dtype=np.float32), frame_index),
+			"im": np.asarray(pred_im[0, ..., 0], dtype=np.float32),
+			"psf": _select_channel(np.asarray(pred_psf[0], dtype=np.float32), frame_index),
+			"noise": _select_channel(np.asarray(pred_noise[0], dtype=np.float32), frame_index),
+		}
+	if isinstance(backend, RichardsonLucyBackend):
+		pred_im = y_pred_tensor[..., :1]
+		pred_psf = y_pred_tensor[..., 1:2]
+		pred_noise = y_pred_tensor[..., 2:3]
+		pred_obs = _reconstruct_observation_from_prediction(
+			pred_im=pred_im,
+			pred_psf=pred_psf,
+			pred_noise=pred_noise,
+			psf_denorm_factor=backend.psf_denorm_factor,
+			noise_norm_factor=backend.noise_norm_factor,
+		)
+		return {
+			"obs": np.asarray(pred_obs[0, ..., 0], dtype=np.float32),
+			"im": np.asarray(pred_im[0, ..., 0], dtype=np.float32),
+			"psf": np.asarray(pred_psf[0, ..., 0], dtype=np.float32),
+			"noise": np.asarray(pred_noise[0, ..., 0], dtype=np.float32),
+		}
+	raise TypeError(f"Unsupported plotting backend type: {type(backend).__name__}")
+
+
+def _plot_algorithm_comparison_example(
+	*,
+	dataset_name: str,
+	example_index: int,
+	frame_index: int,
+	truth: dict[str, np.ndarray],
+	joint: dict[str, np.ndarray],
+	rl: dict[str, np.ndarray],
+	out_path: Path,
+	dpi: int,
+) -> None:
+	import matplotlib
+
+	matplotlib.use("Agg")
+	import matplotlib.pyplot as plt
+
+	from utils.plot_helpers import _imshow, _linear_norm, _power_norm
+
+	component_order = ("obs", "im", "psf", "noise")
+	component_titles = {
+		"obs": f"Obs [{frame_index}]",
+		"im": "Image",
+		"psf": f"PSF [{frame_index}]",
+		"noise": f"Noise [{frame_index}]",
+	}
+	res_joint = {name: truth[name] - joint[name] for name in component_order}
+	res_rl = {name: truth[name] - rl[name] for name in component_order}
+	norms = {
+		"obs": _power_norm([truth["obs"], joint["obs"], rl["obs"]]),
+		"im": _power_norm([truth["im"], joint["im"], rl["im"]]),
+		"psf": _power_norm([truth["psf"], joint["psf"], rl["psf"]]),
+		"noise": _linear_norm([truth["noise"], joint["noise"], rl["noise"]], symmetric=True),
+	}
+	residual_norms = {
+		name: _linear_norm([res_joint[name], res_rl[name]], symmetric=True) for name in component_order
+	}
+	rows = [
+		("Ground truth", truth, norms, "viridis"),
+		("Joint PINN", joint, norms, "viridis"),
+		("Joint residual", res_joint, residual_norms, "coolwarm"),
+		("Richardson-Lucy", rl, norms, "viridis"),
+		("RL residual", res_rl, residual_norms, "coolwarm"),
+	]
+	fig, axes = plt.subplots(len(rows), len(component_order), figsize=(15.5, 18.5), squeeze=False)
+	for row_index, (row_label, row_values, row_norms, cmap) in enumerate(rows):
+		for col_index, component_name in enumerate(component_order):
+			ax = axes[row_index, col_index]
+			title = component_titles[component_name] if row_index == 0 else ""
+			_imshow(ax, row_values[component_name], title, norm=row_norms[component_name], cmap=cmap)
+			if col_index == 0:
+				ax.set_ylabel(row_label, fontsize=11)
+	fig.suptitle(f"{dataset_name} example {example_index} (frame {frame_index})", fontsize=14)
+	fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.98))
+	out_path.parent.mkdir(parents=True, exist_ok=True)
+	fig.savefig(out_path, dpi=dpi)
+	plt.close(fig)
+
+
+def _plot_metric_histogram(
+	*,
+	algorithm: str,
+	metric_name: str,
+	series: dict[str, np.ndarray],
+	out_path: Path,
+	dpi: int,
+) -> None:
+	import matplotlib
+
+	matplotlib.use("Agg")
+	import matplotlib.pyplot as plt
+
+	finite_series = {
+		name: np.asarray(values, dtype=np.float32).reshape(-1)[np.isfinite(np.asarray(values, dtype=np.float32).reshape(-1))]
+		for name, values in series.items()
+	}
+	finite_series = {name: values for name, values in finite_series.items() if values.size > 0}
+	if not finite_series:
+		return
+	all_values = np.concatenate(list(finite_series.values()), axis=0)
+	vmin = float(np.min(all_values))
+	max_value = float(np.max(all_values))
+	if not np.isfinite(vmin) or not np.isfinite(max_value):
+		return
+	if vmin == max_value:
+		max_value = vmin + 1e-6
+	fig, ax = plt.subplots(figsize=(8.5, 5.0))
+	colors = {
+		"val": "tab:blue",
+		"galsim": "tab:orange",
+	}
+	for dataset_name, values in sorted(finite_series.items()):
+		ax.hist(
+			values,
+			bins=60,
+			range=(vmin, max_value),
+			alpha=0.45,
+			label=dataset_name,
+			color=colors.get(dataset_name, None),
+			edgecolor="none",
+		)
+	ax.set_title(f"{algorithm}: {metric_name}")
+	ax.set_xlabel(metric_name)
+	ax.set_ylabel("Count")
+	ax.grid(True, alpha=0.25)
+	ax.legend()
+	fig.tight_layout()
+	out_path.parent.mkdir(parents=True, exist_ok=True)
+	fig.savefig(out_path, dpi=dpi)
+	plt.close(fig)
+
+
+def _load_saved_artifact(result_dir: Path, artifact_name: str) -> dict[str, np.ndarray]:
+	artifact_path = result_dir / artifact_name
+	with np.load(artifact_path) as data:
+		return {
+			"obs": np.asarray(data["obs"], dtype=np.float32),
+			"y_true": np.asarray(data["y_true"], dtype=np.float32),
+			"y_pred": np.asarray(data["y_pred"], dtype=np.float32),
+		}
+
+
+def _load_saved_metrics(result_dir: Path, dataset_name: str) -> dict[str, np.ndarray]:
+	metrics_path = result_dir / f"metrics_{dataset_name}.npz"
+	with np.load(metrics_path) as data:
+		return {key: np.asarray(data[key], dtype=np.float32) for key in data.files}
+
+
+def run_plotting(
+	*,
+	cfg,
+	run_dir: Path,
+	model_label: str,
+	output_dir: Path,
+	plot_examples: int,
+	plot_dpi: int,
+) -> dict[str, Any]:
+	algorithms = ("joint_pinn", "richardson_lucy")
+	plot_root = output_dir / "plots"
+	frame_index = int(dict(getattr(cfg, "RICHARDSON_LUCY_CONFIG", {})).get("frame_index", 0))
+	loaded_artifacts: dict[str, dict[str, dict[str, np.ndarray]]] = {}
+	loaded_metrics: dict[str, dict[str, dict[str, np.ndarray]]] = {}
+	backends: dict[str, EvaluationBackend] = {}
+	for algorithm in algorithms:
+		result_dir = _resolve_result_dir(output_dir, algorithm)
+		manifest_path = result_dir / "inference_manifest.json"
+		if not manifest_path.exists():
+			raise FileNotFoundError(f"Inference manifest not found for plotting: {manifest_path}")
+		with manifest_path.open("r", encoding="utf-8") as handle:
+			manifest = json.load(handle)
+		val_artifact = _load_saved_artifact(result_dir, str(manifest["datasets"]["val"]["artifact_path"]))
+		preview_obs = tf.convert_to_tensor(val_artifact["obs"][:1], dtype=tf.float32)
+		backends[algorithm] = BACKEND_REGISTRY[algorithm].from_run(
+			cfg=cfg,
+			run_dir=run_dir,
+			model_label=model_label,
+			preview_obs=preview_obs,
+		)
+		loaded_artifacts[algorithm] = {
+			dataset_name: _load_saved_artifact(result_dir, str(dataset_info["artifact_path"]))
+			for dataset_name, dataset_info in manifest["datasets"].items()
+		}
+		loaded_metrics[algorithm] = {
+			dataset_name: _load_saved_metrics(result_dir, dataset_name) for dataset_name in manifest["datasets"]
+		}
+
+	example_counts: dict[str, int] = {}
+	for dataset_name in ("val", "galsim"):
+		joint_artifact = loaded_artifacts["joint_pinn"][dataset_name]
+		rl_artifact = loaded_artifacts["richardson_lucy"][dataset_name]
+		available_examples = min(
+			int(joint_artifact["obs"].shape[0]),
+			int(rl_artifact["obs"].shape[0]),
+			int(plot_examples),
+		)
+		example_counts[dataset_name] = available_examples
+		if available_examples <= 0:
+			continue
+		joint_obs = joint_artifact["obs"][:available_examples]
+		joint_truth = joint_artifact["y_true"][:available_examples]
+		joint_pred = joint_artifact["y_pred"][:available_examples]
+		rl_obs = rl_artifact["obs"][:available_examples]
+		rl_truth = rl_artifact["y_true"][:available_examples]
+		rl_pred = rl_artifact["y_pred"][:available_examples]
+		if not np.allclose(joint_obs, rl_obs, rtol=1e-4, atol=1e-5):
+			print(f"[test_on_galsim step4] Warning: obs arrays differ between algorithms for dataset={dataset_name}")
+		for example_index in range(available_examples):
+			truth_components = _extract_truth_plot_components(
+				obs=joint_obs[example_index],
+				y_true=joint_truth[example_index],
+				frame_index=frame_index,
+			)
+			joint_components = _extract_prediction_plot_components(
+				backend=backends["joint_pinn"],
+				y_true=joint_truth[example_index],
+				y_pred=joint_pred[example_index],
+				frame_index=frame_index,
+			)
+			rl_components = _extract_prediction_plot_components(
+				backend=backends["richardson_lucy"],
+				y_true=rl_truth[example_index],
+				y_pred=rl_pred[example_index],
+				frame_index=frame_index,
+			)
+			out_path = plot_root / "examples" / dataset_name / f"example_{example_index:04d}.png"
+			_plot_algorithm_comparison_example(
+				dataset_name=dataset_name,
+				example_index=example_index,
+				frame_index=frame_index,
+				truth=truth_components,
+				joint=joint_components,
+				rl=rl_components,
+				out_path=out_path,
+				dpi=plot_dpi,
+			)
+
+	histogram_counts: dict[str, int] = {}
+	for algorithm in algorithms:
+		metric_names = sorted(
+			set(loaded_metrics[algorithm].get("val", {})) | set(loaded_metrics[algorithm].get("galsim", {}))
+		)
+		histogram_counts[algorithm] = 0
+		for metric_name in metric_names:
+			series = {
+				dataset_name: metrics[metric_name]
+				for dataset_name, metrics in loaded_metrics[algorithm].items()
+				if metric_name in metrics
+			}
+			if not series:
+				continue
+			out_path = plot_root / "histograms" / algorithm / f"{_sanitize_filename(metric_name)}.png"
+			_plot_metric_histogram(
+				algorithm=algorithm,
+				metric_name=metric_name,
+				series=series,
+				out_path=out_path,
+				dpi=plot_dpi,
+			)
+			histogram_counts[algorithm] += 1
+
+	report = {
+		"plot_root": str(plot_root),
+		"frame_index": frame_index,
+		"plot_examples": int(plot_examples),
+		"plot_dpi": int(plot_dpi),
+		"example_counts": example_counts,
+		"histogram_counts": histogram_counts,
+	}
+	plot_root.mkdir(parents=True, exist_ok=True)
+	with (plot_root / "plot_report.json").open("w", encoding="utf-8") as handle:
+		json.dump(report, handle, indent=2)
+	print(f"[test_on_galsim step4] Wrote plots to: {plot_root}")
+	return report
+
+
 __all__ = [
 	"BACKEND_REGISTRY",
 	"DatasetSpec",
@@ -1117,4 +1475,5 @@ __all__ = [
 	"_resolve_runtime_options",
 	"run_analysis",
 	"run_inference",
+	"run_plotting",
 ]

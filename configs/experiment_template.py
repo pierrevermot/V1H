@@ -399,6 +399,8 @@ TEST_ON_GALSIM_CONFIG: dict[str, object] = {
 	"model_label": "best_model",
 	"first_batch_only": True,
 	"eval_batch_size": DATASET_LOAD_CONFIG["val_batch_size"],
+	"plot_examples": 12,
+	"plot_dpi": 150,
 	"output_dir": f"{OUTPUT_BASE_DIR}/{JOINT_PINN_CONFIG['run_name']}/test_on_galsim",
 	"slurm_cpus_per_task": 8,
 	"slurm_time_limit": "04:00:00",
