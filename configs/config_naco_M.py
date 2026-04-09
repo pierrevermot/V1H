@@ -177,6 +177,7 @@ DATASET_GEN_CONFIG: dict[str, object] = {
 GALSIM_TEST_CONFIG: dict[str, object] = {
 	"output_dir": f"{DATASET_GEN_CONFIG['output_dir']}/galsim_test",
 	"seed": RNG_SEED if RNG_SEED is not None else 12345,
+	"normalize_scene_mean": True,
 	"write_tfrecords": True,
 	"tfrecord_name": "batch_0000.tfrecord",
 	"n_plot_examples": 20,
@@ -396,6 +397,7 @@ TEST_ON_GALSIM_CONFIG: dict[str, object] = {
 	"algorithm": "joint_pinn",
 	"run_name": JOINT_PINN_CONFIG["run_name"],
 	"model_label": "best_model",
+	"first_batch_only": True,
 	"eval_batch_size": DATASET_LOAD_CONFIG["val_batch_size"],
 	"output_dir": f"{OUTPUT_BASE_DIR}/{JOINT_PINN_CONFIG['run_name']}/test_on_galsim",
 	"slurm_cpus_per_task": 8,

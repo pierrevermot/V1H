@@ -162,6 +162,7 @@ def _configure_from_experiment_config(cfg) -> dict[str, Any]:
     return {
         "output_dir": output_dir,
         "seed": int(galsim_cfg.get("seed", getattr(cfg, "RNG_SEED", 12345) or 12345)),
+        "normalize_scene_mean": bool(galsim_cfg.get("normalize_scene_mean", True)),
         "write_tfrecords": bool(galsim_cfg.get("write_tfrecords", True)),
         "tfrecord_name": str(galsim_cfg.get("tfrecord_name", DEFAULT_TFRECORD_NAME)),
         "n_plot_examples": int(galsim_cfg.get("n_plot_examples", 20)),
@@ -467,7 +468,17 @@ def draw_stamp(obj: galsim.GSObject) -> galsim.Image:
     return obj.drawImage(nx=N_PIX, ny=N_PIX, scale=PIX_SCALE_ARCSEC)
 
 
-def build_dataset(seed: int) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+def _scale_scene_to_unit_mean(scene: galsim.GSObject) -> tuple[galsim.GSObject, float, float]:
+    """Scale a scene so its rasterized mean equals 1.0 before convolution."""
+    scene_image = draw_stamp(scene)
+    scene_mean = float(np.mean(np.asarray(scene_image.array, dtype=np.float64)))
+    if not np.isfinite(scene_mean) or scene_mean <= 0.0:
+        raise ValueError(f"Cannot normalize scene with non-positive drawn mean: {scene_mean}")
+    scale_factor = 1.0 / scene_mean
+    return scene.withScaledFlux(scale_factor), scene_mean, scale_factor
+
+
+def build_dataset(seed: int, *, normalize_scene_mean: bool = True) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     rng = np.random.default_rng(seed)
 
     scenes: list[galsim.GSObject] = []
@@ -477,6 +488,14 @@ def build_dataset(seed: int) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
 
     for i in range(N_SCENES):
         scene, meta = make_scene(i, rng)
+        if normalize_scene_mean:
+            scene, scene_mean_before, scene_scale_factor = _scale_scene_to_unit_mean(scene)
+            meta = {
+                **meta,
+                "drawn_mean_before_normalization": scene_mean_before,
+                "drawn_mean_after_normalization": 1.0,
+                "flux_scale_applied": scene_scale_factor,
+            }
         scenes.append(scene)
         scene_meta.append(meta)
 
@@ -544,6 +563,10 @@ def build_dataset(seed: int) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         "noise_model": {
             "type": "GaussianNoise",
             "sigmas": NOISE_SIGMAS,
+        },
+        "normalization": {
+            "normalize_scene_mean": bool(normalize_scene_mean),
+            "scene_drawn_mean_target": 1.0 if normalize_scene_mean else None,
         },
         "scene_metadata": scene_meta,
         "psf_metadata": psf_meta,
@@ -816,7 +839,10 @@ def main() -> None:
     cfg = load_experiment_config(args.config)
     runtime_cfg = _configure_from_experiment_config(cfg)
 
-    arrays, metadata = build_dataset(seed=runtime_cfg["seed"])
+    arrays, metadata = build_dataset(
+        seed=runtime_cfg["seed"],
+        normalize_scene_mean=runtime_cfg["normalize_scene_mean"],
+    )
     if runtime_cfg["write_tfrecords"]:
         metadata["tfrecord_dataset"] = save_tfrecord_dataset(
             arrays,
@@ -836,6 +862,7 @@ def main() -> None:
         "central_obscuration_m": CENTRAL_OBSCURATION_M,
         "point_source_sigma_pix": POINT_SOURCE_SIGMA_PIX,
         "noise_sigmas": NOISE_SIGMAS,
+        "normalize_scene_mean": runtime_cfg["normalize_scene_mean"],
         "image_config": SCENE_CONFIG,
         "psf_config": PSF_CONFIG,
     }

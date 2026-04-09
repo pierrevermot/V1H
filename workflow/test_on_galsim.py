@@ -547,15 +547,24 @@ def _make_eval_dataset(cfg, data_dir: Path, batch_size: int) -> tf.data.Dataset:
 	)
 
 
-def _evaluate_dataset(backend: EvaluationBackend, dataset: tf.data.Dataset) -> dict[str, np.ndarray]:
+def _evaluate_dataset(
+	backend: EvaluationBackend,
+	dataset: tf.data.Dataset,
+	*,
+	max_batches: int | None = None,
+) -> tuple[dict[str, np.ndarray], int]:
 	metric_history: dict[str, list[np.ndarray]] = {}
-	for obs_batch, y_true_batch in dataset:
+	batches_used = 0
+	for batch_index, (obs_batch, y_true_batch) in enumerate(dataset):
+		if max_batches is not None and batch_index >= max_batches:
+			break
 		batch_metrics = backend.evaluate_batch(obs_batch, y_true_batch)
 		for name, values in batch_metrics.items():
 			metric_history.setdefault(name, []).append(np.asarray(values, dtype=np.float32).reshape(-1))
+		batches_used += 1
 	if not metric_history:
 		raise ValueError("Dataset evaluation produced no batches")
-	return {name: np.concatenate(chunks, axis=0) for name, chunks in metric_history.items()}
+	return {name: np.concatenate(chunks, axis=0) for name, chunks in metric_history.items()}, batches_used
 
 
 def _summarize_dataset(metrics: dict[str, np.ndarray]) -> dict[str, dict[str, float]]:
@@ -601,12 +610,16 @@ def main() -> None:
 	run_dir = args.run_dir.expanduser().resolve() if args.run_dir is not None else (Path(cfg.OUTPUT_BASE_DIR) / run_name).resolve()
 	model_label = str(args.model_label or test_cfg.get("model_label", "best_model"))
 	eval_batch_size = int(args.eval_batch_size or test_cfg.get("eval_batch_size", cfg.DATASET_LOAD_CONFIG.get("val_batch_size", 64)))
+	first_batch_only = bool(test_cfg.get("first_batch_only", True))
+	max_eval_batches = 1 if first_batch_only else None
 	stats_examples_value = args.stats_examples
 	if stats_examples_value is None:
 		stats_examples_value = test_cfg.get("stats_examples", min(eval_batch_size, 128))
 	stats_examples = int(stats_examples_value)
 	output_dir = args.output_dir.expanduser().resolve() if args.output_dir is not None else Path(str(test_cfg.get("output_dir", run_dir / "test_on_galsim"))).expanduser().resolve()
 	output_dir.mkdir(parents=True, exist_ok=True)
+	if first_batch_only:
+		print("[test_on_galsim] first_batch_only=True, limiting evaluation to the first batch of each dataset")
 
 	dataset_specs = _build_dataset_specs(cfg)
 	datasets = {spec.name: _make_eval_dataset(cfg, spec.path, batch_size=eval_batch_size) for spec in dataset_specs}
@@ -625,13 +638,21 @@ def main() -> None:
 
 	all_metrics: dict[str, dict[str, np.ndarray]] = {}
 	all_summaries: dict[str, dict[str, dict[str, float]]] = {}
+	batches_evaluated: dict[str, int] = {}
 	for spec in dataset_specs:
 		print(f"[test_on_galsim] Evaluating {spec.name} dataset from {spec.path}")
-		metrics = _evaluate_dataset(backend, datasets[spec.name])
+		metrics, n_batches_used = _evaluate_dataset(
+			backend,
+			datasets[spec.name],
+			max_batches=max_eval_batches,
+		)
 		summary = _summarize_dataset(metrics)
 		all_metrics[spec.name] = metrics
 		all_summaries[spec.name] = summary
+		batches_evaluated[spec.name] = n_batches_used
 		np.savez_compressed(output_dir / f"metrics_{spec.name}.npz", **metrics)
+		if first_batch_only:
+			print(f"[test_on_galsim] Used first {n_batches_used} batch for {spec.name}")
 		print(_render_summary_table(f"Summary for {spec.name}", summary))
 
 	comparison_text = _render_comparison_table(
@@ -646,6 +667,8 @@ def main() -> None:
 		"run_dir": str(run_dir),
 		"model_label": model_label,
 		"eval_batch_size": eval_batch_size,
+		"first_batch_only": first_batch_only,
+		"batches_evaluated": batches_evaluated,
 		"dataset_paths": {spec.name: str(spec.path) for spec in dataset_specs},
 		"summaries": all_summaries,
 	}
