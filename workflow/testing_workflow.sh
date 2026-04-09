@@ -7,8 +7,9 @@
 #
 # Steps:
 #   1. Generate GalSim testing dataset (CPU)
-#   2a. Run inference on val + GalSim and save artifacts (GPU)
-#   3. Compute statistics and losses from saved inference artifacts (GPU)
+#   2a. Run joint PINN inference on val + GalSim and save artifacts (GPU)
+#   2b. Run Richardson-Lucy inference on val + GalSim and save artifacts (CPU)
+#   3. Compute statistics and losses from saved inference artifacts for all algorithms (GPU)
 # ===========================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -214,7 +215,36 @@ chmod +x "$STEP2A_SCRIPT"
 JOB2A=$(submit_job "$STEP2A_SCRIPT")
 echo "Step 2a (save val + GalSim inference): JobID=$JOB2A"
 
-STEP3_DEPENDENCY_OPT=$(join_dependency_opt "$JOB2A")
+# ===========================================================================
+# Step 2b: Run Richardson-Lucy inference on val + GalSim (CPU)
+# ===========================================================================
+STEP2B_SCRIPT="$LOG_DIR/testing_step2b_inference_richardson_lucy.sh"
+cat > "$STEP2B_SCRIPT" <<SLURM_EOF
+#!/usr/bin/env bash
+#SBATCH --job-name=test_on_galsim_rl_infer
+#SBATCH --output=$LOG_DIR/testing_step2b_%j.out
+#SBATCH --error=$LOG_DIR/testing_step2b_%j.err
+#SBATCH --account=$SLURM_CPU_ACCOUNT
+#SBATCH --cpus-per-task=$TEST_EVAL_CPUS
+#SBATCH --time=$TEST_EVAL_TIME
+#SBATCH --hint=nomultithread
+$STEP2_DEPENDENCY_OPT
+$EXCLUDE_OPT
+
+module purge
+module load $CPU_MODULE_TF
+export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
+cd "$ROOT_DIR"
+
+python3 -u workflow/test_on_galsim_step2b_richardson_lucy.py \
+	--config "$CONFIG"
+SLURM_EOF
+chmod +x "$STEP2B_SCRIPT"
+
+JOB2B=$(submit_job "$STEP2B_SCRIPT")
+echo "Step 2b (save Richardson-Lucy inference): JobID=$JOB2B"
+
+STEP3_DEPENDENCY_OPT=$(join_dependency_opt "$JOB2A" "$JOB2B")
 
 # ===========================================================================
 # Step 3: Compute statistics and losses from saved inference (GPU)
@@ -242,17 +272,23 @@ export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
 cd "$ROOT_DIR"
 
 python3 -u workflow/test_on_galsim_step3_analysis.py \
-	--config "$CONFIG"
+	--config "$CONFIG" \
+	--algorithm joint_pinn
+
+python3 -u workflow/test_on_galsim_step3_analysis.py \
+	--config "$CONFIG" \
+	--algorithm richardson_lucy
 SLURM_EOF
 chmod +x "$STEP3_SCRIPT"
 
 JOB3=$(submit_job "$STEP3_SCRIPT")
-echo "Step 3 (analyze saved inference): JobID=$JOB3"
+echo "Step 3 (analyze saved inference for all algorithms): JobID=$JOB3"
 
 echo ""
 echo "=========================================="
 echo "All jobs submitted. Testing pipeline:"
 echo "  Step 1 ($JOB1) -> GalSim test dataset generation"
 echo "  Step 1 ($JOB1) -> Step 2a ($JOB2A) save val + GalSim inference"
-echo "  Step 2a ($JOB2A) -> Step 3 ($JOB3) compute statistics and losses"
+echo "  Step 1 ($JOB1) -> Step 2b ($JOB2B) save Richardson-Lucy inference"
+echo "  Step 2a ($JOB2A), Step 2b ($JOB2B) -> Step 3 ($JOB3) compute statistics and losses"
 echo "=========================================="

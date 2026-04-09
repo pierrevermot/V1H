@@ -405,6 +405,15 @@ TEST_ON_GALSIM_CONFIG: dict[str, object] = {
 }
 
 
+RICHARDSON_LUCY_CONFIG: dict[str, object] = {
+	"num_iter": 30,
+	"psf_source": "truth",
+	"frame_index": 0,
+	"clip": False,
+	"filter_epsilon": None,
+}
+
+
 # =============================================================================
 # SLURM configuration
 # =============================================================================

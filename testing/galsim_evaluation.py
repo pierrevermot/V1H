@@ -28,7 +28,7 @@ from utils.model_io import (
 	_resolve_joint_model_paths,
 	_resolve_model_paths,
 )
-from utils.normalization import _normalize_psf_for_observation
+from utils.normalization import _compute_norm_factor, _normalize_psf_for_observation
 from workflow.joint_pinn_fourhead_training import FourHeadJointPinnModel
 
 
@@ -64,7 +64,7 @@ class EvaluationBackend:
 	) -> "EvaluationBackend":
 		raise NotImplementedError
 
-	def predict_batch(self, obs: tf.Tensor) -> tf.Tensor:
+	def predict_batch(self, obs: tf.Tensor, y_true: tf.Tensor | None = None) -> tf.Tensor:
 		raise NotImplementedError
 
 	def evaluate_prediction_batch(
@@ -76,7 +76,7 @@ class EvaluationBackend:
 		raise NotImplementedError
 
 	def evaluate_batch(self, obs: tf.Tensor, y_true: tf.Tensor) -> dict[str, np.ndarray]:
-		y_pred = self.predict_batch(obs)
+		y_pred = self.predict_batch(obs, y_true=y_true)
 		return self.evaluate_prediction_batch(obs, y_true, y_pred)
 
 	def describe(self) -> dict[str, Any]:
@@ -428,7 +428,7 @@ class JointPinnBackend(EvaluationBackend):
 			"model_path": str(self.model_path),
 		}
 
-	def predict_batch(self, obs: tf.Tensor) -> tf.Tensor:
+	def predict_batch(self, obs: tf.Tensor, y_true: tf.Tensor | None = None) -> tf.Tensor:
 		obs = tf.convert_to_tensor(obs, dtype=tf.float32)
 		return tf.convert_to_tensor(self.model(obs, training=False), dtype=tf.float32)
 
@@ -583,6 +583,164 @@ class JointPinnBackend(EvaluationBackend):
 			"nll_noise_residual": nll_noise_residual,
 			"nll_noise_logsigma2": nll_noise_logsigma2,
 			"r2_pinn": r2_pinn,
+		}
+		return {key: value.numpy().astype(np.float32) for key, value in result.items()}
+
+
+@register_backend("richardson_lucy")
+class RichardsonLucyBackend(EvaluationBackend):
+	def __init__(
+		self,
+		*,
+		num_iter: int,
+		psf_source: str,
+		frame_index: int,
+		clip: bool,
+		filter_epsilon: float | None,
+		norm_psf,
+		norm_noise,
+		psf_denorm_factor: float,
+		noise_norm_factor: float,
+	):
+		self.num_iter = int(num_iter)
+		self.psf_source = str(psf_source)
+		self.frame_index = int(frame_index)
+		self.clip = bool(clip)
+		self.filter_epsilon = None if filter_epsilon is None else float(filter_epsilon)
+		self.norm_psf = norm_psf
+		self.norm_noise = norm_noise
+		self.psf_denorm_factor = float(psf_denorm_factor)
+		self.noise_norm_factor = float(noise_norm_factor)
+		try:
+			from skimage.restoration import richardson_lucy
+		except ImportError as exc:
+			raise ImportError(
+				"richardson_lucy backend requires scikit-image. Install scikit-image in the runtime environment."
+			) from exc
+		self._richardson_lucy = richardson_lucy
+
+	@classmethod
+	def from_run(
+		cls,
+		*,
+		cfg,
+		run_dir: Path,
+		model_label: str,
+		preview_obs: tf.Tensor,
+	) -> "RichardsonLucyBackend":
+		rl_cfg = dict(getattr(cfg, "RICHARDSON_LUCY_CONFIG", {}))
+		dataset_cfg = dict(cfg.DATASET_LOAD_CONFIG)
+		preview_input_shape = tuple(int(v) for v in preview_obs.shape[1:])
+		n_pix_crop = int(preview_input_shape[0])
+		norm_psf = dataset_cfg.get("norm_psf")
+		norm_noise = dataset_cfg.get("norm_noise", dataset_cfg.get("norm_res"))
+		return cls(
+			num_iter=int(rl_cfg.get("num_iter", 30)),
+			psf_source=str(rl_cfg.get("psf_source", "truth")),
+			frame_index=int(rl_cfg.get("frame_index", 0)),
+			clip=bool(rl_cfg.get("clip", False)),
+			filter_epsilon=rl_cfg.get("filter_epsilon", None),
+			norm_psf=norm_psf,
+			norm_noise=norm_noise,
+			psf_denorm_factor=_compute_norm_factor(norm_psf, n_pix_crop),
+			noise_norm_factor=_compute_norm_factor(norm_noise, n_pix_crop),
+		)
+
+	def describe(self) -> dict[str, Any]:
+		return {
+			"backend": self.backend_name,
+			"num_iter": self.num_iter,
+			"psf_source": self.psf_source,
+			"frame_index": self.frame_index,
+			"clip": self.clip,
+			"filter_epsilon": self.filter_epsilon,
+		}
+
+	def _select_truth_frame(self, tensor: tf.Tensor) -> tf.Tensor:
+		channels = int(tensor.shape[-1])
+		if channels <= self.frame_index:
+			raise ValueError(
+				f"Requested frame_index={self.frame_index} but tensor only has {channels} channel(s)"
+			)
+		return tensor[..., self.frame_index : self.frame_index + 1]
+
+	def _select_psf_model(self, y_true: tf.Tensor) -> tf.Tensor:
+		if self.psf_source != "truth":
+			raise ValueError(f"Unsupported richardson_lucy psf_source={self.psf_source!r}")
+		_, truth_psf, _, _ = _split_truth(y_true)
+		return self._select_truth_frame(truth_psf)
+
+	def predict_batch(self, obs: tf.Tensor, y_true: tf.Tensor | None = None) -> tf.Tensor:
+		if y_true is None:
+			raise ValueError("richardson_lucy inference requires y_true to access the configured PSF model")
+		obs = tf.convert_to_tensor(obs, dtype=tf.float32)
+		y_true = tf.convert_to_tensor(y_true, dtype=tf.float32)
+		psf_model = tf.convert_to_tensor(self._select_psf_model(y_true), dtype=tf.float32)
+		obs_frame = tf.convert_to_tensor(self._select_truth_frame(obs), dtype=tf.float32)
+
+		obs_np = np.asarray(obs_frame[..., 0], dtype=np.float32)
+		psf_np = np.asarray(psf_model[..., 0], dtype=np.float32)
+		pred_images: list[np.ndarray] = []
+		for example_index in range(obs_np.shape[0]):
+			obs_example = np.asarray(obs_np[example_index], dtype=np.float32)
+			psf_example = np.asarray(psf_np[example_index], dtype=np.float32)
+			psf_phys = psf_example / float(self.psf_denorm_factor)
+			psf_phys, _, _ = _normalize_psf_for_observation(
+				tf.convert_to_tensor(psf_phys[None, ..., None], dtype=tf.float32)
+			)
+			psf_kernel = np.asarray(psf_phys[0, ..., 0], dtype=np.float32)
+			obs_input = np.clip(obs_example, a_min=0.0, a_max=None)
+			pred_image = self._richardson_lucy(
+				obs_input,
+				psf_kernel,
+				num_iter=self.num_iter,
+				clip=self.clip,
+				filter_epsilon=self.filter_epsilon,
+			)
+			pred_images.append(np.asarray(pred_image, dtype=np.float32))
+
+		pred_im = np.stack(pred_images, axis=0)[..., None]
+		pred_psf = np.asarray(psf_model, dtype=np.float32)
+		pred_psf_phys = tf.convert_to_tensor(pred_psf / float(self.psf_denorm_factor), dtype=tf.float32)
+		pred_psf_phys, _, _ = _normalize_psf_for_observation(pred_psf_phys)
+		pred_obs = _convolve_image_with_psfs(tf.convert_to_tensor(pred_im, dtype=tf.float32), pred_psf_phys)
+		pred_noise_phys = pred_obs - obs_frame
+		pred_noise = pred_noise_phys * float(self.noise_norm_factor)
+		return tf.concat(
+			[
+				tf.convert_to_tensor(pred_im, dtype=tf.float32),
+				tf.convert_to_tensor(pred_psf, dtype=tf.float32),
+				tf.convert_to_tensor(pred_noise, dtype=tf.float32),
+			],
+			axis=-1,
+		)
+
+	def evaluate_prediction_batch(
+		self,
+		obs: tf.Tensor,
+		y_true: tf.Tensor,
+		y_pred: tf.Tensor,
+	) -> dict[str, np.ndarray]:
+		_ = obs
+		y_true = tf.convert_to_tensor(y_true, dtype=tf.float32)
+		y_pred = tf.convert_to_tensor(y_pred, dtype=tf.float32)
+		truth_im, truth_psf_all, truth_noise_all, _ = _split_truth(y_true)
+		truth_psf = self._select_truth_frame(truth_psf_all)
+		truth_noise = self._select_truth_frame(truth_noise_all)
+		pred_im = y_pred[..., :1]
+		pred_psf = y_pred[..., 1:2]
+		pred_noise = y_pred[..., 2:3]
+		truth_all = _concat_components(truth_im, truth_psf, truth_noise)
+		pred_all = _concat_components(pred_im, pred_psf, pred_noise)
+		result = {
+			"mse": _per_example_mse(truth_all, pred_all),
+			"mse_im": _per_example_mse(truth_im, pred_im),
+			"mse_psf": _per_example_mse(truth_psf, pred_psf),
+			"mse_noise": _per_example_mse(truth_noise, pred_noise),
+			"r2": _per_example_r2(truth_all, pred_all),
+			"r2_im": _per_example_r2(truth_im, pred_im),
+			"r2_psf": _per_example_r2(truth_psf, pred_psf),
+			"r2_noise": _per_example_r2(truth_noise, pred_noise),
 		}
 		return {key: value.numpy().astype(np.float32) for key, value in result.items()}
 
@@ -752,7 +910,7 @@ def _infer_dataset(
 			break
 		obs_tensor = tf.convert_to_tensor(obs_batch, dtype=tf.float32)
 		y_true_tensor = tf.convert_to_tensor(y_true_batch, dtype=tf.float32)
-		y_pred_tensor = tf.convert_to_tensor(backend.predict_batch(obs_tensor), dtype=tf.float32)
+		y_pred_tensor = tf.convert_to_tensor(backend.predict_batch(obs_tensor, y_true=y_true_tensor), dtype=tf.float32)
 		obs_chunks.append(np.asarray(obs_tensor, dtype=np.float32))
 		y_true_chunks.append(np.asarray(y_true_tensor, dtype=np.float32))
 		y_pred_chunks.append(np.asarray(y_pred_tensor, dtype=np.float32))
