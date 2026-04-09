@@ -764,6 +764,13 @@ class WienerBackend(EvaluationBackend):
 		self.norm_noise = norm_noise
 		self.psf_denorm_factor = float(psf_denorm_factor)
 		self.noise_norm_factor = float(noise_norm_factor)
+		try:
+			from skimage.restoration import wiener
+		except ImportError as exc:
+			raise ImportError(
+				"wiener backend requires scikit-image. Install scikit-image in the runtime environment."
+			) from exc
+		self._wiener = wiener
 
 	@classmethod
 	def from_run(
@@ -834,12 +841,20 @@ class WienerBackend(EvaluationBackend):
 			psf_phys_norm, _, _ = _normalize_psf_for_observation(psf_phys_t)
 			psf_kernel = np.asarray(psf_phys_norm[0, ..., 0], dtype=np.float64)
 			noise_phys = noise_example / float(self.noise_norm_factor)
-			noise_variance = float(np.var(noise_phys))
-			psf_shifted = np.fft.ifftshift(psf_kernel)
-			obs_fft = np.fft.fft2(obs_example)
-			psf_fft = np.fft.fft2(psf_shifted)
-			img_fft = obs_fft * np.conj(psf_fft) / (np.abs(psf_fft) ** 2 + noise_variance)
-			pred_im = np.real(np.fft.ifft2(img_fft)).astype(np.float32)
+			noise_variance = max(float(np.var(noise_phys)), 1e-12)
+			obs_input = np.clip(obs_example, a_min=0.0, a_max=None)
+			pred_im = self._wiener(
+				obs_input,
+				psf_kernel,
+				balance=noise_variance,
+				clip=False,
+			)
+			pred_im = np.maximum(np.real(np.asarray(pred_im, dtype=np.float64)), 0.0)
+			target_flux = float(np.sum(obs_example))
+			pred_flux = float(np.sum(pred_im))
+			if np.isfinite(target_flux) and np.isfinite(pred_flux) and pred_flux > 0.0:
+				pred_im *= target_flux / pred_flux
+			pred_im = pred_im.astype(np.float32)
 			pred_images.append(pred_im)
 
 		pred_im = np.stack(pred_images, axis=0)[..., None]

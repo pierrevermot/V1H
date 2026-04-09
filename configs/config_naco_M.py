@@ -182,13 +182,13 @@ GALSIM_TEST_CONFIG: dict[str, object] = {
 	"tfrecord_name": "batch_0000.tfrecord",
 	"n_plot_examples": 20,
 	"n_scenes": 10,
-	"n_psfs": 10,
-	"n_noise_levels": 10,
+	"n_psfs": 11,
+	"n_noise_levels": 11,
 	"point_source_sigma_pix": 0.1,
 	"diam_m": VLT_PRIMARY_DIAMETER_M,
 	"central_obscuration_m": VLT_CENTRAL_OBSCURATION_DIAMETER_M,
-	"noise_sigma_min": 0.5,
-	"noise_sigma_max": 24.0,
+	"noise_sigma_min": 0.,
+	"noise_sigma_max": 50.0,
 	"image_config": {
 		"primary_sersic_n_range": [0.8, 4.5],
 		"primary_half_light_radius_arcsec_range": [0.08, 0.28],
@@ -211,7 +211,7 @@ GALSIM_TEST_CONFIG: dict[str, object] = {
 		"point_source_offset_arcsec_range": [-1.15, 1.15],
 	},
 	"psf_config": {
-		"aberration_amplitude_range": [0.004, 0.030],
+		"aberration_amplitude_range": [0.0, 0.05],
 		"aberration_scales": {
 			"defocus": 1.00,
 			"astig1": 0.70,
