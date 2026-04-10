@@ -26,7 +26,7 @@ N_PIX: int = 160
 # Output directory (root for all outputs of this experiment)
 # =============================================================================
 
-OUTPUT_BASE_DIR: str = "/lustre/fsn1/projects/rech/nab/udl61tt/V1G/naco_m_band_01"
+OUTPUT_BASE_DIR: str = "/lustre/fsn1/projects/rech/nab/udl61tt/V1H/naco_m_band_02"
 
 
 # =============================================================================
