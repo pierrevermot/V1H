@@ -436,11 +436,54 @@ $TF_THREADING
 
 BATCH_SIZES=(${BATCH_SIZES[*]})
 INDEPENDENT_HEADS=(${INDEPENDENT_HEADS[*]})
+TOTAL_CASES=$(( ${#BATCH_SIZES[@]} * (${#INDEPENDENT_HEADS[@]} + 1) ))
+CASE_INDEX=0
+JOB_START_TS=\$(date +%s)
+
+log_step() {
+	echo "[\$(date '+%F %T')] \$*"
+}
+
+format_elapsed() {
+	local total_seconds="\$1"
+	local hours minutes seconds
+	hours=\$((total_seconds / 3600))
+	minutes=\$(((total_seconds % 3600) / 60))
+	seconds=\$((total_seconds % 60))
+	printf '%02d:%02d:%02d' "\$hours" "\$minutes" "\$seconds"
+}
+
+run_case() {
+	local label="\$1"
+	local result_file="\$2"
+	shift 2
+
+	CASE_INDEX=\$((CASE_INDEX + 1))
+	local case_start_ts case_end_ts case_elapsed status
+	case_start_ts=\$(date +%s)
+	log_step "Case \${CASE_INDEX}/\${TOTAL_CASES}: starting \${label}"
+
+	if python3 -u workflow/benchmark_timing.py "\$@" > "\${result_file}"; then
+		case_end_ts=\$(date +%s)
+		case_elapsed=\$((case_end_ts - case_start_ts))
+		log_step "Case \${CASE_INDEX}/\${TOTAL_CASES}: finished \${label} elapsed=\$(format_elapsed \${case_elapsed}) result=\${result_file}"
+	else
+		status=\$?
+		case_end_ts=\$(date +%s)
+		case_elapsed=\$((case_end_ts - case_start_ts))
+		log_step "Case \${CASE_INDEX}/\${TOTAL_CASES}: failed \${label} elapsed=\$(format_elapsed \${case_elapsed}) status=\${status} result=\${result_file}"
+		exit "\${status}"
+	fi
+}
+
+log_step "Starting architecture benchmark: tag=$ATAG desc=$ADESC device=$ADEVICE n_gpus=$ANGPUS benchmark_cpus=$ACPUS booked_cpus=$ABOOKED_CPUS total_cases=\${TOTAL_CASES}"
 
 for BS in "\${BATCH_SIZES[@]}"; do
+	batch_start_ts=\$(date +%s)
+	log_step "Starting batch size \${BS}"
 	for HEAD in "\${INDEPENDENT_HEADS[@]}"; do
 		RESULT_FILE="$RESULTS_DIR/bench_${ATAG}_indep_\${HEAD}_bs\${BS}.json"
-		python3 -u workflow/benchmark_timing.py \\
+		run_case "mode=independent head=\${HEAD} batch_size=\${BS}" "\${RESULT_FILE}" \\
 			--config "$CONFIG" \\
 			--mode independent \\
 			--head-target "\${HEAD}" \\
@@ -448,21 +491,26 @@ for BS in "\${BATCH_SIZES[@]}"; do
 			--n-warmup $N_WARMUP \\
 			--n-repeats $N_REPEATS \\
 			--device $ADEVICE \\
-			--n-gpus $ANGPUS \\
-			> "\${RESULT_FILE}"
+			--n-gpus $ANGPUS
 	done
 
 	RESULT_FILE="$RESULTS_DIR/bench_${ATAG}_joint_bs\${BS}.json"
-	python3 -u workflow/benchmark_timing.py \\
+	run_case "mode=joint batch_size=\${BS}" "\${RESULT_FILE}" \\
 		--config "$CONFIG" \\
 		--mode joint \\
 		--batch-size "\${BS}" \\
 		--n-warmup $N_WARMUP \\
 		--n-repeats $N_REPEATS \\
 		--device $ADEVICE \\
-		--n-gpus $ANGPUS \\
-		> "\${RESULT_FILE}"
+		--n-gpus $ANGPUS
+	batch_end_ts=\$(date +%s)
+	batch_elapsed=\$((batch_end_ts - batch_start_ts))
+	log_step "Finished batch size \${BS} elapsed=\$(format_elapsed \${batch_elapsed})"
 done
+
+JOB_END_TS=\$(date +%s)
+JOB_ELAPSED=\$((JOB_END_TS - JOB_START_TS))
+log_step "Completed architecture benchmark: tag=$ATAG total_cases=\${TOTAL_CASES} elapsed=\$(format_elapsed \${JOB_ELAPSED})"
 SLURM_EOF
 		chmod +x "$JOB_SCRIPT"
 		JOB_ID=$(submit_job "$JOB_SCRIPT")
@@ -503,9 +551,23 @@ module load $CPU_MODULE_TF
 export PYTHONPATH="$ROOT_DIR":"\${PYTHONPATH:-}"
 cd "$ROOT_DIR"
 
-python3 -u workflow/benchmark_collect_results.py \\
+COLLECT_START_TS=\$(date +%s)
+
+echo "[\$(date '+%F %T')] Starting benchmark result collection from $RESULTS_DIR"
+
+if python3 -u workflow/benchmark_collect_results.py \\
 	--results-dir "$RESULTS_DIR" \\
-	--output "$OUTPUT_DIR/benchmark_summary.csv"
+	--output "$OUTPUT_DIR/benchmark_summary.csv"; then
+	COLLECT_END_TS=\$(date +%s)
+	COLLECT_ELAPSED=\$((COLLECT_END_TS - COLLECT_START_TS))
+	echo "[\$(date '+%F %T')] Finished benchmark result collection: $OUTPUT_DIR/benchmark_summary.csv elapsed=\$(printf '%02d:%02d:%02d' \$((COLLECT_ELAPSED / 3600)) \$(((COLLECT_ELAPSED % 3600) / 60)) \$((COLLECT_ELAPSED % 60)))"
+else
+	status=\$?
+	COLLECT_END_TS=\$(date +%s)
+	COLLECT_ELAPSED=\$((COLLECT_END_TS - COLLECT_START_TS))
+	echo "[\$(date '+%F %T')] Benchmark result collection failed status=\${status} elapsed=\$(printf '%02d:%02d:%02d' \$((COLLECT_ELAPSED / 3600)) \$(((COLLECT_ELAPSED % 3600) / 60)) \$((COLLECT_ELAPSED % 60)))" >&2
+	exit "\${status}"
+fi
 SLURM_EOF
 	chmod +x "$COLLECT_SCRIPT"
 	COLLECT_JOB=$(submit_job "$COLLECT_SCRIPT")
