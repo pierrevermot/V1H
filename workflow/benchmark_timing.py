@@ -270,11 +270,11 @@ def main() -> None:
         model, input_shape = _build_joint_model(cfg)
         model_desc = "joint_pinn_fourhead"
 
-    n_params = int(model.count_params())
-
     timing = _benchmark_forward(
         model, input_shape, args.batch_size, args.n_warmup, args.n_repeats, effective_device,
     )
+
+    n_params = int(model.count_params())
 
     result = {
         "mode": args.mode,

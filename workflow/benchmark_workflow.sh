@@ -377,6 +377,10 @@ for (( a=0; a<N_ARCHS; a++ )); do
 	ADEVICE="${ARCH_DEVICES[$a]}"
 	ANGPUS="${ARCH_NGPUS[$a]}"
 	ATIME="${ARCH_TIMES[$a]}"
+	ABOOKED_CPUS="$ACPUS"
+	if (( ABOOKED_CPUS < 10 )); then
+		ABOOKED_CPUS=10
+	fi
 
 	# Build optional SBATCH directives
 	PARTITION_OPT=""
@@ -417,7 +421,7 @@ export OMP_NUM_THREADS=$ACPUS"
 #SBATCH --qos=$AQOS
 $PARTITION_OPT
 $GRES_OPT
-#SBATCH --cpus-per-task=$ACPUS
+#SBATCH --cpus-per-task=$ABOOKED_CPUS
 #SBATCH --time=$ATIME
 #SBATCH --hint=nomultithread
 $CONSTRAINT_OPT
@@ -488,7 +492,7 @@ if ! $DRY_RUN && [[ ${#ALL_JOB_IDS[@]} -gt 0 ]]; then
 #SBATCH --error=$LOG_DIR/collect_%j.err
 #SBATCH --account=$SLURM_CPU_ACCOUNT
 #SBATCH --qos=qos_cpu-t3
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=10
 #SBATCH --time=00:30:00
 #SBATCH --hint=nomultithread
 #SBATCH --dependency=afterany:$DEP_STR
