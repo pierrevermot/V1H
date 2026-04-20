@@ -206,7 +206,7 @@ ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.16.1"
 ARCH_DEVICES[$idx]="gpu"
 ARCH_NGPUS[$idx]="1"
 ARCH_TIMES[$idx]="04:00:00"
-((idx++))
+idx=$((idx + 1))
 
 # --- V100 4 GPUs ---
 ARCH_TAGS[$idx]="v100_4gpu"
@@ -222,7 +222,7 @@ ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.16.1"
 ARCH_DEVICES[$idx]="gpu"
 ARCH_NGPUS[$idx]="4"
 ARCH_TIMES[$idx]="04:00:00"
-((idx++))
+idx=$((idx + 1))
 
 # --- H100 1 GPU ---
 ARCH_TAGS[$idx]="h100_1gpu"
@@ -238,7 +238,7 @@ ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.17.0"
 ARCH_DEVICES[$idx]="gpu"
 ARCH_NGPUS[$idx]="1"
 ARCH_TIMES[$idx]="04:00:00"
-((idx++))
+idx=$((idx + 1))
 
 # --- H100 4 GPUs ---
 ARCH_TAGS[$idx]="h100_4gpu"
@@ -254,7 +254,7 @@ ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.17.0"
 ARCH_DEVICES[$idx]="gpu"
 ARCH_NGPUS[$idx]="4"
 ARCH_TIMES[$idx]="04:00:00"
-((idx++))
+idx=$((idx + 1))
 
 # --- CPU on V100 node: 1 core ---
 ARCH_TAGS[$idx]="cpu_v100node_1core"
@@ -270,7 +270,7 @@ ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.16.1"
 ARCH_DEVICES[$idx]="cpu"
 ARCH_NGPUS[$idx]="0"
 ARCH_TIMES[$idx]="10:00:00"
-((idx++))
+idx=$((idx + 1))
 
 # --- CPU on V100 node: 40 cores ---
 ARCH_TAGS[$idx]="cpu_v100node_40core"
@@ -286,7 +286,7 @@ ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.16.1"
 ARCH_DEVICES[$idx]="cpu"
 ARCH_NGPUS[$idx]="0"
 ARCH_TIMES[$idx]="10:00:00"
-((idx++))
+idx=$((idx + 1))
 
 # --- CPU on H100 node: 1 core ---
 ARCH_TAGS[$idx]="cpu_h100node_1core"
@@ -302,7 +302,7 @@ ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.17.0"
 ARCH_DEVICES[$idx]="cpu"
 ARCH_NGPUS[$idx]="0"
 ARCH_TIMES[$idx]="10:00:00"
-((idx++))
+idx=$((idx + 1))
 
 # --- CPU on H100 node: 96 cores ---
 ARCH_TAGS[$idx]="cpu_h100node_96core"
@@ -318,7 +318,7 @@ ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.17.0"
 ARCH_DEVICES[$idx]="cpu"
 ARCH_NGPUS[$idx]="0"
 ARCH_TIMES[$idx]="10:00:00"
-((idx++))
+idx=$((idx + 1))
 
 # --- CPU partition (scalar): 1 core ---
 ARCH_TAGS[$idx]="cpu_scalar_1core"
@@ -334,7 +334,7 @@ ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.16.1"
 ARCH_DEVICES[$idx]="cpu"
 ARCH_NGPUS[$idx]="0"
 ARCH_TIMES[$idx]="20:00:00"
-((idx++))
+idx=$((idx + 1))
 
 # --- CPU partition (scalar): 40 cores ---
 ARCH_TAGS[$idx]="cpu_scalar_40core"
@@ -350,7 +350,7 @@ ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.16.1"
 ARCH_DEVICES[$idx]="cpu"
 ARCH_NGPUS[$idx]="0"
 ARCH_TIMES[$idx]="20:00:00"
-((idx++))
+idx=$((idx + 1))
 
 N_ARCHS=$idx
 
@@ -448,7 +448,7 @@ SLURM_EOF
 			chmod +x "$JOB_SCRIPT"
 			JOB_ID=$(submit_job "$JOB_SCRIPT")
 			ALL_JOB_IDS+=("$JOB_ID")
-			((JOB_COUNT++))
+			JOB_COUNT=$((JOB_COUNT + 1))
 		done
 
 		# ---- Joint model ----
@@ -491,7 +491,7 @@ SLURM_EOF
 		chmod +x "$JOB_SCRIPT"
 		JOB_ID=$(submit_job "$JOB_SCRIPT")
 		ALL_JOB_IDS+=("$JOB_ID")
-		((JOB_COUNT++))
+		JOB_COUNT=$((JOB_COUNT + 1))
 	done
 	echo ""
 done
