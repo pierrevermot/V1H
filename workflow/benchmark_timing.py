@@ -7,7 +7,7 @@ Usage
     python benchmark_timing.py --config <experiment.py> --mode joint \
         --batch-size 64 --n-warmup 5 --n-repeats 50
 
-Outputs a single JSON line to stdout with timing statistics.
+Outputs a single JSON line to stdout with graph-mode latency and throughput statistics.
 """
 
 from __future__ import annotations
@@ -31,15 +31,25 @@ def _detect_device_info() -> dict:
     import tensorflow as tf
     gpus = tf.config.list_physical_devices("GPU")
     cpus = tf.config.list_physical_devices("CPU")
+    cpu_affinity_count = ""
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            cpu_affinity_count = len(os.sched_getaffinity(0))
+        except OSError:
+            cpu_affinity_count = ""
     info = {
-        "n_cpus_tf": len(cpus),
+        "n_cpu_devices_tf": len(cpus),
         "n_gpus_tf": len(gpus),
         "gpu_names": [],
         "cpu_count_os": os.cpu_count(),
+        "cpu_affinity_count": cpu_affinity_count,
         "slurm_cpus_per_task": os.environ.get("SLURM_CPUS_PER_TASK", ""),
         "slurm_job_id": os.environ.get("SLURM_JOB_ID", ""),
         "slurm_partition": os.environ.get("SLURM_JOB_PARTITION", ""),
         "slurm_nodelist": os.environ.get("SLURM_NODELIST", ""),
+        "tf_num_interop_threads": os.environ.get("TF_NUM_INTEROP_THREADS", ""),
+        "tf_num_intraop_threads": os.environ.get("TF_NUM_INTRAOP_THREADS", ""),
+        "omp_num_threads": os.environ.get("OMP_NUM_THREADS", ""),
     }
     for gpu in gpus:
         try:
@@ -48,6 +58,29 @@ def _detect_device_info() -> dict:
         except Exception:
             info["gpu_names"].append(str(gpu))
     return info
+
+
+def _configure_precision(dtype_name: str, mixed_precision_policy: str) -> dict[str, str | bool]:
+    """Configure runtime precision for benchmarking."""
+    import tensorflow as tf
+
+    if mixed_precision_policy != "none" and dtype_name != "float32":
+        raise ValueError("--mixed-precision requires --dtype float32")
+
+    tf.keras.backend.set_floatx(dtype_name)
+    if mixed_precision_policy == "none":
+        tf.keras.mixed_precision.set_global_policy(dtype_name)
+    else:
+        tf.keras.mixed_precision.set_global_policy(mixed_precision_policy)
+
+    policy = tf.keras.mixed_precision.global_policy()
+    return {
+        "dtype": dtype_name,
+        "mixed_precision_policy": mixed_precision_policy,
+        "global_policy": policy.name,
+        "compute_dtype": policy.compute_dtype,
+        "variable_dtype": policy.variable_dtype,
+    }
 
 
 def _build_independent_model(cfg, head_target: str):
@@ -178,44 +211,88 @@ def _build_joint_model(cfg):
     return joint_model, input_shape
 
 
-def _benchmark_forward(model, input_shape, batch_size, n_warmup, n_repeats, device):
-    """Run forward passes and measure timing."""
+def _benchmark_forward(model, input_shape, batch_size, n_warmup, n_repeats, device, *, jit_compile):
+    """Run graph-mode forward passes and measure latency and throughput."""
     import tensorflow as tf
 
-    dummy = tf.random.normal((batch_size,) + input_shape)
+    compute_dtype = tf.dtypes.as_dtype(getattr(model, "compute_dtype", None) or tf.keras.mixed_precision.global_policy().compute_dtype)
+    dummy = tf.random.normal((batch_size,) + input_shape, dtype=compute_dtype)
 
     if device == "cpu":
         target_device = "/CPU:0"
     else:
         target_device = "/GPU:0"
 
-    # Warm-up
-    with tf.device(target_device):
-        for _ in range(n_warmup):
-            _ = model(dummy, training=False)
+    effective_n_warmup = n_warmup + 3
+
+    @tf.function(jit_compile=jit_compile, reduce_retracing=True)
+    def compiled_inference(batch):
+        return model(batch, training=False)
+
+    def sync_if_needed() -> None:
         if device != "cpu":
             tf.test.experimental.sync_devices()
 
-    # Timed runs
-    times = []
+    # Build and compile the graph before warmup so trace/compile time is excluded.
+    with tf.device(target_device):
+        compile_start = time.perf_counter()
+        _ = compiled_inference(dummy)
+        sync_if_needed()
+        compile_end = time.perf_counter()
+
+    # Warm-up
+    with tf.device(target_device):
+        for _ in range(effective_n_warmup):
+            _ = compiled_inference(dummy)
+            sync_if_needed()
+
+    # Timed runs with explicit device synchronization on GPU so this measures
+    # strict end-to-end call latency rather than optimistic async dispatch.
+    latencies_s = []
     with tf.device(target_device):
         for _ in range(n_repeats):
             t0 = time.perf_counter()
-            _ = model(dummy, training=False)
-            if device != "cpu":
-                tf.test.experimental.sync_devices()
+            _ = compiled_inference(dummy)
+            sync_if_needed()
             t1 = time.perf_counter()
-            times.append(t1 - t0)
+            latencies_s.append(t1 - t0)
 
-    times = np.array(times)
+    latencies_s = np.array(latencies_s)
+    throughput_sps = batch_size / latencies_s
+
     return {
-        "mean_s": float(np.mean(times)),
-        "std_s": float(np.std(times)),
-        "median_s": float(np.median(times)),
-        "min_s": float(np.min(times)),
-        "max_s": float(np.max(times)),
-        "per_sample_mean_ms": float(np.mean(times) / batch_size * 1000),
-        "times_s": times.tolist(),
+        "execution_mode": "graph",
+        "jit_compile": bool(jit_compile),
+        "requested_warmup_calls": int(n_warmup),
+        "effective_warmup_calls": int(effective_n_warmup),
+        "first_compiled_call_s": float(compile_end - compile_start),
+        "synchronization_mode": (
+            "strict_end_to_end_device_sync"
+            if device != "cpu"
+            else "host_blocking"
+        ),
+        "synchronization_note": (
+            "GPU timing includes explicit device synchronization after every call, so it measures strict end-to-end latency rather than optimistic asynchronous dispatch."
+            if device != "cpu"
+            else "CPU timing is host-blocking and measures strict end-to-end latency per call."
+        ),
+        "latency": {
+            "batch_mean_s": float(np.mean(latencies_s)),
+            "batch_std_s": float(np.std(latencies_s)),
+            "batch_median_s": float(np.median(latencies_s)),
+            "batch_min_s": float(np.min(latencies_s)),
+            "batch_max_s": float(np.max(latencies_s)),
+            "batch_times_s": latencies_s.tolist(),
+        },
+        "throughput": {
+            "samples_per_second_mean": float(np.mean(throughput_sps)),
+            "samples_per_second_std": float(np.std(throughput_sps)),
+            "samples_per_second_median": float(np.median(throughput_sps)),
+            "samples_per_second_min": float(np.min(throughput_sps)),
+            "samples_per_second_max": float(np.max(throughput_sps)),
+            "per_sample_mean_ms": float(np.mean(latencies_s) / batch_size * 1000),
+            "per_sample_median_ms": float(np.median(latencies_s) / batch_size * 1000),
+        },
     }
 
 
@@ -231,8 +308,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--n-repeats", type=int, default=50, help="Number of timed forward passes")
     parser.add_argument("--device", choices=["cpu", "gpu"], default=None,
                         help="Force device (auto-detect if omitted)")
-    parser.add_argument("--n-gpus", type=int, default=1,
-                        help="Number of GPUs to use (for multi-GPU benchmarks)")
+    parser.add_argument("--jit-compile", action="store_true",
+                        help="Enable XLA JIT compilation for the inference graph")
+    parser.add_argument("--dtype", choices=["float32", "float64"], default="float32",
+                        help="Default dtype for non-mixed-precision benchmarking")
+    parser.add_argument("--mixed-precision", choices=["none", "mixed_float16", "mixed_bfloat16"], default="none",
+                        help="Optional mixed precision policy for supported hardware")
     return parser.parse_args()
 
 
@@ -246,10 +327,14 @@ def main() -> None:
         tf.config.set_visible_devices([], "GPU")
     else:
         gpus = tf.config.list_physical_devices("GPU")
-        if args.n_gpus > 0 and gpus:
-            tf.config.set_visible_devices(gpus[:args.n_gpus], "GPU")
-            for gpu in gpus[:args.n_gpus]:
-                tf.config.experimental.set_memory_growth(gpu, True)
+        if gpus:
+            tf.config.set_visible_devices(gpus[:1], "GPU")
+            tf.config.experimental.set_memory_growth(gpus[0], True)
+        elif args.device == "gpu":
+            print("ERROR: --device gpu requested but no GPU is available", file=sys.stderr)
+            sys.exit(1)
+
+    precision_config = _configure_precision(args.dtype, args.mixed_precision)
 
     device_info = _detect_device_info()
 
@@ -271,7 +356,13 @@ def main() -> None:
         model_desc = "joint_pinn_fourhead"
 
     timing = _benchmark_forward(
-        model, input_shape, args.batch_size, args.n_warmup, args.n_repeats, effective_device,
+        model,
+        input_shape,
+        args.batch_size,
+        args.n_warmup,
+        args.n_repeats,
+        effective_device,
+        jit_compile=args.jit_compile,
     )
 
     n_params = int(model.count_params())
@@ -284,7 +375,10 @@ def main() -> None:
         "n_warmup": args.n_warmup,
         "n_repeats": args.n_repeats,
         "device": effective_device,
-        "n_gpus_requested": args.n_gpus,
+        "jit_compile": bool(args.jit_compile),
+        "dtype": args.dtype,
+        "mixed_precision": args.mixed_precision,
+        "precision": precision_config,
         "n_params": n_params,
         "input_shape": list(input_shape),
         "device_info": device_info,

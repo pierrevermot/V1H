@@ -7,14 +7,13 @@
 #
 # Usage:
 #   ./benchmark_workflow.sh <config.py> [--dry-run] [--n-warmup 5] [--n-repeats 50]
-#       [--output-dir /path/to/results]
+#       [--output-dir /path/to/results] [--jit-compile] [--dtype float32]
+#       [--mixed-precision none]
 #
 # Architectures tested:
 #   GPU:
 #     - V100 32GB, 1 GPU  (v100-32g, gpu default partition)
-#     - V100 32GB, 4 GPUs (v100-32g, gpu default partition)
 #     - H100 80GB, 1 GPU  (gpu_p6 partition)
-#     - H100 80GB, 4 GPUs (gpu_p6 partition)
 #   CPU (on V100 nodes): Intel Xeon Gold 6248, 40 cores/node
 #     - 1 CPU core  (cpu_p1 partition, constraint v100)
 #     - 40 CPU cores (cpu_p1 partition, constraint v100)
@@ -47,6 +46,9 @@ N_WARMUP=5
 N_REPEATS=50
 OUTPUT_DIR=""
 CPU_MODULE_TF="tensorflow-gpu/py3/2.16.1"
+JIT_COMPILE=false
+BENCH_DTYPE="float32"
+MIXED_PRECISION="none"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -54,13 +56,16 @@ while [[ $# -gt 0 ]]; do
 		--n-warmup)   N_WARMUP="$2"; shift 2 ;;
 		--n-repeats)  N_REPEATS="$2"; shift 2 ;;
 		--output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+		--jit-compile) JIT_COMPILE=true; shift ;;
+		--dtype) BENCH_DTYPE="$2"; shift 2 ;;
+		--mixed-precision) MIXED_PRECISION="$2"; shift 2 ;;
 		-*)           echo "Unknown option: $1" >&2; exit 1 ;;
 		*)            CONFIG="$1"; shift ;;
 	esac
 done
 
 if [[ -z "$CONFIG" ]]; then
-	echo "Usage: $0 <config.py> [--dry-run] [--n-warmup N] [--n-repeats N] [--output-dir DIR]" >&2
+	echo "Usage: $0 <config.py> [--dry-run] [--n-warmup N] [--n-repeats N] [--output-dir DIR] [--jit-compile] [--dtype DTYPE] [--mixed-precision POLICY]" >&2
 	exit 1
 fi
 CONFIG="$(realpath "$CONFIG")"
@@ -130,6 +135,9 @@ echo "V100 GPU account  : $SLURM_GPU_ACCOUNT_V100"
 echo "H100 GPU account  : $SLURM_GPU_ACCOUNT_H100"
 echo "N warmup          : $N_WARMUP"
 echo "N repeats         : $N_REPEATS"
+echo "JIT compile       : $JIT_COMPILE"
+echo "Dtype             : $BENCH_DTYPE"
+echo "Mixed precision   : $MIXED_PRECISION"
 echo "Dry run           : $DRY_RUN"
 echo "=========================================="
 
@@ -178,18 +186,20 @@ BENCHMARK_CASE_COUNT=0
 #   SLURM_ACCOUNT   - --account
 #   SLURM_PARTITION - --partition (or empty)
 #   SLURM_QOS       - --qos
-#   SLURM_GRES      - --gres (e.g. gpu:1, gpu:4, or empty for CPU)
+#   SLURM_GRES      - --gres (e.g. gpu:1 or empty for CPU)
 #   SLURM_CPUS      - --cpus-per-task
 #   SLURM_CONSTRAINT- -C constraint (or empty)
 #   ARCH_PREMODULE  - module to load before TF module (e.g. arch/h100)
 #   MODULE_TF       - TensorFlow module name
 #   DEVICE_FLAG     - --device argument for benchmark script (cpu or gpu)
-#   N_GPUS_FLAG     - --n-gpus argument for benchmark script
 #   TIME_LIMIT      - --time for the SLURM job
 
 declare -a ARCH_TAGS ARCH_DESCS ARCH_ACCOUNTS ARCH_PARTITIONS ARCH_QOSS ARCH_GRESS
 declare -a ARCH_CPUSS ARCH_CONSTRAINTS ARCH_PREMODULES ARCH_MODULES ARCH_DEVICES
-declare -a ARCH_NGPUS ARCH_TIMES
+declare -a ARCH_TIMES
+
+V100_CPUS_PER_GPU=10
+H100_CPUS_PER_GPU=24
 
 idx=0
 
@@ -200,28 +210,11 @@ ARCH_ACCOUNTS[$idx]="$SLURM_GPU_ACCOUNT_V100"
 ARCH_PARTITIONS[$idx]=""
 ARCH_QOSS[$idx]="qos_gpu-t3"
 ARCH_GRESS[$idx]="gpu:1"
-ARCH_CPUSS[$idx]="10"
+ARCH_CPUSS[$idx]="$((1 * V100_CPUS_PER_GPU))"
 ARCH_CONSTRAINTS[$idx]="v100-32g"
 ARCH_PREMODULES[$idx]=""
 ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.16.1"
 ARCH_DEVICES[$idx]="gpu"
-ARCH_NGPUS[$idx]="1"
-ARCH_TIMES[$idx]="04:00:00"
-idx=$((idx + 1))
-
-# --- V100 4 GPUs ---
-ARCH_TAGS[$idx]="v100_4gpu"
-ARCH_DESCS[$idx]="V100-32G 4 GPUs (Intel Xeon Gold 6248)"
-ARCH_ACCOUNTS[$idx]="$SLURM_GPU_ACCOUNT_V100"
-ARCH_PARTITIONS[$idx]=""
-ARCH_QOSS[$idx]="qos_gpu-t3"
-ARCH_GRESS[$idx]="gpu:4"
-ARCH_CPUSS[$idx]="40"
-ARCH_CONSTRAINTS[$idx]="v100-32g"
-ARCH_PREMODULES[$idx]=""
-ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.16.1"
-ARCH_DEVICES[$idx]="gpu"
-ARCH_NGPUS[$idx]="4"
 ARCH_TIMES[$idx]="04:00:00"
 idx=$((idx + 1))
 
@@ -232,28 +225,11 @@ ARCH_ACCOUNTS[$idx]="$SLURM_GPU_ACCOUNT_H100"
 ARCH_PARTITIONS[$idx]="gpu_p6"
 ARCH_QOSS[$idx]="qos_gpu_h100-t3"
 ARCH_GRESS[$idx]="gpu:1"
-ARCH_CPUSS[$idx]="24"
+ARCH_CPUSS[$idx]="$((1 * H100_CPUS_PER_GPU))"
 ARCH_CONSTRAINTS[$idx]="h100"
 ARCH_PREMODULES[$idx]="module load arch/h100"
 ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.17.0"
 ARCH_DEVICES[$idx]="gpu"
-ARCH_NGPUS[$idx]="1"
-ARCH_TIMES[$idx]="04:00:00"
-idx=$((idx + 1))
-
-# --- H100 4 GPUs ---
-ARCH_TAGS[$idx]="h100_4gpu"
-ARCH_DESCS[$idx]="H100-80G 4 GPUs (Intel Xeon Platinum 8468)"
-ARCH_ACCOUNTS[$idx]="$SLURM_GPU_ACCOUNT_H100"
-ARCH_PARTITIONS[$idx]="gpu_p6"
-ARCH_QOSS[$idx]="qos_gpu_h100-t3"
-ARCH_GRESS[$idx]="gpu:4"
-ARCH_CPUSS[$idx]="96"
-ARCH_CONSTRAINTS[$idx]="h100"
-ARCH_PREMODULES[$idx]="module load arch/h100"
-ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.17.0"
-ARCH_DEVICES[$idx]="gpu"
-ARCH_NGPUS[$idx]="4"
 ARCH_TIMES[$idx]="04:00:00"
 idx=$((idx + 1))
 
@@ -269,7 +245,6 @@ ARCH_CONSTRAINTS[$idx]="v100-32g"
 ARCH_PREMODULES[$idx]=""
 ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.16.1"
 ARCH_DEVICES[$idx]="cpu"
-ARCH_NGPUS[$idx]="0"
 ARCH_TIMES[$idx]="10:00:00"
 idx=$((idx + 1))
 
@@ -285,7 +260,6 @@ ARCH_CONSTRAINTS[$idx]="v100-32g"
 ARCH_PREMODULES[$idx]=""
 ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.16.1"
 ARCH_DEVICES[$idx]="cpu"
-ARCH_NGPUS[$idx]="0"
 ARCH_TIMES[$idx]="10:00:00"
 idx=$((idx + 1))
 
@@ -301,7 +275,6 @@ ARCH_CONSTRAINTS[$idx]="h100"
 ARCH_PREMODULES[$idx]="module load arch/h100"
 ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.17.0"
 ARCH_DEVICES[$idx]="cpu"
-ARCH_NGPUS[$idx]="0"
 ARCH_TIMES[$idx]="10:00:00"
 idx=$((idx + 1))
 
@@ -317,7 +290,6 @@ ARCH_CONSTRAINTS[$idx]="h100"
 ARCH_PREMODULES[$idx]="module load arch/h100"
 ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.17.0"
 ARCH_DEVICES[$idx]="cpu"
-ARCH_NGPUS[$idx]="0"
 ARCH_TIMES[$idx]="10:00:00"
 idx=$((idx + 1))
 
@@ -333,7 +305,6 @@ ARCH_CONSTRAINTS[$idx]=""
 ARCH_PREMODULES[$idx]=""
 ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.16.1"
 ARCH_DEVICES[$idx]="cpu"
-ARCH_NGPUS[$idx]="0"
 ARCH_TIMES[$idx]="20:00:00"
 idx=$((idx + 1))
 
@@ -349,7 +320,6 @@ ARCH_CONSTRAINTS[$idx]=""
 ARCH_PREMODULES[$idx]=""
 ARCH_MODULES[$idx]="tensorflow-gpu/py3/2.16.1"
 ARCH_DEVICES[$idx]="cpu"
-ARCH_NGPUS[$idx]="0"
 ARCH_TIMES[$idx]="20:00:00"
 idx=$((idx + 1))
 
@@ -375,11 +345,14 @@ for (( a=0; a<N_ARCHS; a++ )); do
 	APREMODULE="${ARCH_PREMODULES[$a]}"
 	AMODULE="${ARCH_MODULES[$a]}"
 	ADEVICE="${ARCH_DEVICES[$a]}"
-	ANGPUS="${ARCH_NGPUS[$a]}"
 	ATIME="${ARCH_TIMES[$a]}"
 	ABOOKED_CPUS="$ACPUS"
 	if (( ABOOKED_CPUS < 10 )); then
 		ABOOKED_CPUS=10
+	fi
+	JIT_COMPILE_FLAG=""
+	if $JIT_COMPILE; then
+		JIT_COMPILE_FLAG="--jit-compile"
 	fi
 
 	# Build optional SBATCH directives
@@ -476,7 +449,7 @@ run_case() {
 	fi
 }
 
-log_step "Starting architecture benchmark: tag=$ATAG desc=$ADESC device=$ADEVICE n_gpus=$ANGPUS benchmark_cpus=$ACPUS booked_cpus=$ABOOKED_CPUS total_cases=\${TOTAL_CASES}"
+log_step "Starting architecture benchmark: tag=$ATAG desc=$ADESC device=$ADEVICE benchmark_cpus=$ACPUS booked_cpus=$ABOOKED_CPUS dtype=$BENCH_DTYPE mixed_precision=$MIXED_PRECISION jit_compile=$JIT_COMPILE total_cases=\${TOTAL_CASES}"
 
 for BS in "\${BATCH_SIZES[@]}"; do
 	batch_start_ts=\$(date +%s)
@@ -491,7 +464,9 @@ for BS in "\${BATCH_SIZES[@]}"; do
 			--n-warmup $N_WARMUP \\
 			--n-repeats $N_REPEATS \\
 			--device $ADEVICE \\
-			--n-gpus $ANGPUS
+			--dtype $BENCH_DTYPE \\
+			--mixed-precision $MIXED_PRECISION \\
+			$JIT_COMPILE_FLAG
 	done
 
 	RESULT_FILE="$RESULTS_DIR/bench_${ATAG}_joint_bs\${BS}.json"
@@ -502,7 +477,9 @@ for BS in "\${BATCH_SIZES[@]}"; do
 		--n-warmup $N_WARMUP \\
 		--n-repeats $N_REPEATS \\
 		--device $ADEVICE \\
-		--n-gpus $ANGPUS
+		--dtype $BENCH_DTYPE \\
+		--mixed-precision $MIXED_PRECISION \\
+		$JIT_COMPILE_FLAG
 	batch_end_ts=\$(date +%s)
 	batch_elapsed=\$((batch_end_ts - batch_start_ts))
 	log_step "Finished batch size \${BS} elapsed=\$(format_elapsed \${batch_elapsed})"
