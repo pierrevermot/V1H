@@ -78,8 +78,10 @@ ensure_launcher_python() {
 		return 0
 	fi
 	if command -v module >/dev/null 2>&1; then
+		set +u  # module/conda activate scripts may reference unset variables
 		module purge
 		module load "$CPU_MODULE_TF"
+		set -u
 		python3 -c "import numpy" >/dev/null 2>&1 && return 0
 	fi
 	echo "Unable to import numpy: activate an environment or load $CPU_MODULE_TF before running this script." >&2
