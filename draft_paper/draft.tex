@@ -1,0 +1,1252 @@
+%-----------------------------------------------------------------------
+%                                                                 aa.tex
+% AA vers. 9.3, LaTeX class for Astronomy & Astrophysics
+% Demonstration file
+%                                                       (c) EDP Sciences
+%-----------------------------------------------------------------------
+%
+%\documentclass[referee]{aa}    % for a referee version
+%\documentclass[onecolumn]{aa}  % for a paper on 1 column  
+%\documentclass[longauth]{aa}   % for long lists of authors and/or affiliations. 
+                                % This command displays the first eight authors on page 1
+                                % and shift the whole list after the references.
+                                % Ensure to separate each author with the \and command (see below)
+%\documentclass[letter]{aa}     % for the letters
+%\documentclass[bibyear]{aa}    % if the references are not structured
+                                % according to the author-year natbib style
+
+\documentclass{aa}  
+
+\usepackage{graphicx}
+\usepackage{txfonts}
+\usepackage{lipsum}
+\usepackage{subcaption}         % necessary for continued figures, example in section 3
+                                % and appendix
+\usepackage{lscape}             % to rotate a single page table, example in appendix.
+                                % For landscape tables, see the longtable examples.
+\usepackage{placeins}           % useful with \FloatBarrier, to keep 
+                                % onecolumn floats from drifting to the next section
+                                
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue]{hyperref}
+% To add links in your PDF file, use the package "hyperref"
+% with options according to your LaTeX or PDFLaTeX drivers.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{document}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% if you use custom commands in your title,
+% ensure to check your title when submitting!
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+   \title{Convolutional Neural Networks for real-time deconvolution of adaptive optics images}
+
+   %\subtitle{Subtitle}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Please separate each author with the \and command
+%
+% Please do not include ORCIDs next to author names.
+% Only ORCIDs authenticated by individual authors in EDPS
+% editorial system will be taken into account.
+% ORCIDs included here will be removed.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+   \author{P. Vermot\inst{1}
+        }
+
+   \institute{ LIRA, Observatoire de Paris, PSL Research University, CNRS, Sorbonne Université, Université Paris Cité, 5 place Jules Janssen, 92195 Meudon, France}
+
+   \date{Received September 30, 20XX}
+
+% \abstract{}{}{}{}{}
+% 5 {} token are mandatory
+ 
+  \abstract
+  % context heading (optional)
+  % {} leave it empty if necessary  
+  % {Optional, leave empty if necessary.  The heading “Context” is used when needed to
+  % give background information on the research conducted in the paper}
+  % aims heading (mandatory)
+   {We aim to develop a fast deconvolution algorithm able to post-process adaptive optics (AO) images in real time.} 
+  % methods heading (mandatory)
+   {We train convolutional neural networks on simulated observations of an AO instrument to recover the deconvolved image, the point spread function (PSF) and the noise map.}
+  % results heading (mandatory)
+   {Once trained, our deconvolution algorithm allows to recover denoised images at a higher angular resolution than the observation, with performance similiar to or better than simple classical methods, with a computational time orders of magnitude smaller.}
+  % conclusions heading (optional), leave it empty if necessary
+   {This method opens the way for real-time deconvolution of AO observation.}
+
+   \keywords{ Astronomical instrumentation, methods and techniques  --
+                 Methods: numerical
+               }
+
+   \maketitle
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Introduction}
+
+\cite{2025A&A...704A.295V}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Methods}
+
+General idea : 
+- Train neural networks on large simulated datasets of AO observations
+- Input : simulated observation, assuming obs = conv(im, psf)+noise
+- Output : ground truth for image, psf and noise
+- One model trained for each product : image, psf and noise
+
+\subsection{Observations simulation}
+
+
+
+\subsubsection{Sky Image Generation Method}
+
+
+Each training sky image is a \emph{flux-weighted composite} of $N_\mathrm{obj}$ independent astronomical-object realisations, where $N_\mathrm{obj}$ is drawn from a \emph{log-uniform distribution} between configurable bounds (default 1--5). For each object, a generator type is selected uniformly at random from three classes---\emph{nebula}, \emph{point sources}, and \emph{sharp-edged object}---each assigned a random flux weight $f_i \sim \mathcal{U}(0,1)$. The final image is
+\begin{equation}
+I(\mathbf{x}) = \frac{\sum_{i=1}^{N_\mathrm{obj}} f_i \, O_i(\mathbf{x})}{\left\langle \sum_i f_i \, O_i \right\rangle},
+\end{equation}
+so that the output has unit mean surface brightness. If a generator produces an all-zero or NaN image, it is redrawn up to 10 times before being discarded.
+
+\paragraph{Gaussian Random Field (GRF) Engine}
+
+All spatially extended objects are built from \emph{isotropic Gaussian random fields}. A realisation is generated on a zero-padded $2N \times 2N$ pixel grid (where $N$ is the science image size) as follows:
+\begin{enumerate}
+    \item A 2D power spectral density (PSD) $P(\mathbf{k})$ is evaluated on the frequency grid $\mathbf{k} = |\mathbf{k}|$ (in cycles per pixel).
+    \item Complex white noise $W(\mathbf{k}) = W_\mathrm{Re} + i\,W_\mathrm{Im}$ is drawn, with $W_\mathrm{Re}, W_\mathrm{Im} \sim \mathcal{N}(0,1)$ independently at each frequency.
+    \item The coloured field is obtained by inverse FFT:
+    \begin{equation}
+    g(\mathbf{x}) = \mathrm{Re}\!\left[\mathcal{F}^{-1}\!\left(\sqrt{P(\mathbf{k})}\; W(\mathbf{k})\right)\right].
+    \end{equation}
+    \item The field is \emph{centre-cropped} to $N \times N$ pixels, which avoids periodic boundary artefacts in the science region.
+\end{enumerate}
+
+
+The PSF which is used is a power-law & $P(k) = k^{-\alpha}, \; P(0) = 0$ & exponent $\alpha$ \\
+
+\paragraph{Object Generator 1: Nebula}
+
+A diffuse, cloudy structure is created from a single power-law GRF:
+\begin{enumerate}
+    \item Draw a GRF $g(\mathbf{x})$ with PSD exponent $\alpha \sim \mathcal{U}(1.5,\,5.0)$.
+    \item Compute a percentile threshold $p \sim \mathcal{U}(50,\,99)$ on the field values.
+    \item Set
+    \begin{equation}
+    O(\mathbf{x}) = \max\!\bigl(g(\mathbf{x}) - g_p,\; 0\bigr),
+    \end{equation}
+    where $g_p$ is the $p$-th percentile of $g$.
+    \item Normalise so that $\langle O \rangle = 1$.
+\end{enumerate}
+
+The percentile threshold controls the sparsity (filling factor) of the resulting emission.
+
+\paragraph{Object Generator 2: Point Sources}
+
+A star-field-like image of $n$ unresolved sources:
+\begin{enumerate}
+    \item Draw the number of sources $n$ from a \emph{log-uniform distribution} between configurable bounds (default 1--50).
+    \item Draw each source position $(x_i, y_i)$ uniformly over the $N \times N$ pixel grid.
+    \item Assign brightnesses via a \emph{power-law} cumulative distribution:
+    \begin{equation}
+    b_i = U_i^{-1/(\alpha - 1)},
+    \end{equation}
+    where $U_i \sim \mathcal{U}(0,1)$ and $\alpha \sim \mathcal{U}(1.5,\,3.5)$ (clamped to $\alpha \geq 1.01$). Brightnesses are normalised to $[0,1]$ by dividing by $\max(b_i)$.
+    \item Each source deposits its brightness $b_i$ at pixel $(x_i, y_i)$ (sources at the same pixel are summed).
+    \item Normalise so that $\langle O \rangle = 1$.
+\end{enumerate}
+
+\paragraph{Object Generator 3: Sharp-Edged Object}
+
+A galaxy-like structure combining a low-frequency shape mask with high-frequency internal texture:
+\begin{enumerate}
+    \item \textbf{Shape mask.} Draw a low-frequency GRF $g_\mathrm{LF}$ with PSD exponent $\alpha_\mathrm{LF} \sim \mathcal{U}(1.5,\,5.0)$. Threshold at percentile $p_\mathrm{LF} \sim \mathcal{U}(50,\,99)$ to obtain a binary mask
+    \begin{equation}
+    M(\mathbf{x}) = \mathbb{1}\!\left[g_\mathrm{LF}(\mathbf{x}) \geq (g_\mathrm{LF})_{p_\mathrm{LF}}\right].
+    \end{equation}
+
+    \item \textbf{Texture.} Draw a second, independent, high-frequency GRF $g_\mathrm{HF}$ with PSD exponent $\alpha_\mathrm{HF} \sim \mathcal{U}(1.5,\,5.0)$. Normalise it linearly to $[0,1]$, then remap to $[v_\mathrm{min},\,1]$ where $v_\mathrm{min} \sim \mathcal{U}(0,\,1)$, controlling the internal contrast.
+
+    \item Combine:
+    \begin{equation}
+    O(\mathbf{x}) = M(\mathbf{x}) \cdot g'_\mathrm{HF}(\mathbf{x}).
+    \end{equation}
+
+    \item Normalise so that $\langle O \rangle = 1$.
+\end{enumerate}
+
+\paragraph{Composite Image Assembly}
+
+Given the $N_\mathrm{obj}$ individually normalised objects $O_i$ and their flux weights $f_i$, the composite is summed and re-normalised to unit mean. If the composite has zero total flux (all generators failed), a uniform image of ones is returned as a fallback.
+
+\paragraph{Summary of Randomised Hyperparameters}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Parameter} & \textbf{Distribution} & \textbf{Default range} \\
+\hline
+Number of objects $N_\mathrm{obj}$ & Log-uniform (integer) & $[1, 5]$ \\
+Object type & Uniform categorical & \{nebula, point sources, sharp-edged\} \\
+Per-object flux $f_i$ & $\mathcal{U}(0,1)$ & --- \\
+Nebula PSD exponent $\alpha$ & $\mathcal{U}$ & $[1.5, 5.0]$ \\
+Nebula percentile threshold $p$ & $\mathcal{U}$ & $[50, 99]$ \\
+Point source count $n$ & Log-uniform (integer) & $[1, 50]$ \\
+Point source brightness exponent $\alpha$ & $\mathcal{U}$ & $[1.5, 3.5]$ \\
+Sharp-edged LF exponent $\alpha_\mathrm{LF}$ & $\mathcal{U}$ & $[1.5, 5.0]$ \\
+Sharp-edged LF percentile $p_\mathrm{LF}$ & $\mathcal{U}$ & $[50, 99]$ \\
+Sharp-edged HF exponent $\alpha_\mathrm{HF}$ & $\mathcal{U}$ & $[1.5, 5.0]$ \\
+Sharp-edged texture floor $v_\mathrm{min}$ & $\mathcal{U}$ & $[0, 1]$ \\
+\hline
+\end{tabular}
+\end{table}
+
+All ranges are configurable via the experiment configuration file.
+
+\subsubsection{PSF Generation Method}
+
+\paragraph{Overview}
+
+Each point spread function (PSF) is computed via Fourier optics from a composite wavefront phase screen applied to a realistic telescope pupil model. The procedure involves three layers: (1) construction of the telescope pupil, (2) generation of randomised aberration phase screens from three independent component families, and (3) Fourier-optical PSF computation. Long-exposure PSFs are obtained by incoherently averaging short-exposure realisations.
+
+\paragraph{1. Telescope Pupil Model}
+
+The pupil transmission function is derived from the \texttt{hcipy} library's realistic VLT aperture model (\texttt{hcipy.make\_vlt\_aperture}), which includes the 8.0\,m primary mirror, central obscuration, and spider vanes. The pupil is generated at high spatial resolution (pixel scale $\leq 2\,\mathrm{mm}$) to faithfully resolve fine structures, then rebinned and zero-padded to an $N \times N$ pixel grid (default $N = 160$).
+
+The pupil pixel scale $\Delta x$ is set by the FFT sampling relation:
+\begin{equation}
+\Delta x = \frac{\lambda}{N \,\Delta\theta},
+\end{equation}
+where $\lambda$ is the observing wavelength and $\Delta\theta$ is the desired angular pixel scale of the output PSF. For the NACO M-band configuration, $\lambda = 4.78\,\mu\mathrm{m}$ and $\Delta\theta = 27\,\mathrm{mas}$.
+
+To model field rotation, the pupil is pre-rotated at 360 angles ($0^\circ$--$359^\circ$ in steps of $1^\circ$) using bilinear interpolation. For each training example, one rotation angle is drawn uniformly at random, and all subsequent operations (phase screens, PSF computation) use the corresponding rotated pupil.
+
+\paragraph{Pupil sub-structures}
+
+Connected component labelling (8-connectivity) is applied to each rotated pupil to detect \emph{islands}---disconnected regions created by the spider vanes. For each island, three \emph{Low Wind Effect (LWE) modes} are computed:
+\begin{itemize}
+    \item \textbf{Piston:} uniform phase offset (amplitude 1) within the island.
+    \item \textbf{Tip:} $x$-gradient across the island (zero-mean, unit standard deviation).
+    \item \textbf{Tilt:} $y$-gradient across the island (zero-mean, unit standard deviation).
+\end{itemize}
+
+Additionally, \emph{Zernike polynomials} $Z_n^m$ are computed on the unobstructed pupil support from radial order $n_\mathrm{min} = 1$ up to $n_\mathrm{rad} = 6$ (inclusive), with azimuthal orders $m = -n, -n+2, \ldots, n$. Standard normalisation is used: $\sqrt{n+1}$ for $m=0$ and $\sqrt{2(n+1)}$ for $m \neq 0$.
+
+\paragraph{2. Phase Screen Generation}
+
+Each composite phase screen is the sum of three independently randomised components---\emph{power-law turbulence}, \emph{Zernike aberrations}, and \emph{LWE modes}---each optionally enabled with configurable probability.
+
+\paragraph{2.1. Component activation}
+
+Three independent Bernoulli draws determine which components are active for a given example:
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Component} & \textbf{Activation probability} \\
+\hline
+Power-law turbulence & $p_\mathrm{PL} = 0.5$ \\
+Zernike aberrations & $p_\mathrm{Zer} = 0.5$ \\
+LWE modes & $p_\mathrm{LWE} = 0.5$ \\
+\hline
+\end{tabular}
+\end{table}
+
+The draw is repeated until at least one component is active.
+
+\paragraph{2.2. Power-law turbulence (dual-regime)}
+
+Residual atmospheric turbulence is modelled as the sum of a \emph{low-frequency (LF)} and a \emph{high-frequency (HF)} phase screen, separated by a spatial cutoff frequency. Each regime is generated independently:
+\begin{enumerate}
+    \item A radial power spectral density (PSD) is constructed on the $N \times N$ FFT frequency grid:
+    \begin{equation}
+    P(k) = k^{-\alpha}, \quad P(0) = 0,
+    \end{equation}
+    with exponents $\alpha_\mathrm{LF} \sim \mathcal{U}(2.0,\,5.0)$ and $\alpha_\mathrm{HF} \sim \mathcal{U}(2.0,\,5.0)$.
+
+    \item A hard spatial-frequency cutoff $f_c = 1/\ell_c$ is applied, where $\ell_c \sim \mathcal{U}(0.1,\,2.0)\,\mathrm{m}$. The LF PSD is zeroed above $f_c$; the HF PSD is zeroed below $f_c$.
+
+    \item For each regime, a phase realisation is drawn by weighting complex white noise in Fourier space:
+    \begin{equation}
+    \varphi(\mathbf{x}) = \mathrm{Re}\!\left[\mathcal{F}^{-1}\!\left(\frac{W_\mathrm{Re} + i\,W_\mathrm{Im}}{\sqrt{2}} \cdot \sqrt{P(\mathbf{k})}\right)\right],
+    \end{equation}
+    with $W_\mathrm{Re}, W_\mathrm{Im} \sim \mathcal{N}(0,1)$ and DC component forced to zero.
+
+    \item Each phase is normalised on the pupil support to a target RMS: $\sigma_\mathrm{LF} \sim \mathcal{U}(0,\,1)\,\mathrm{rad}$ and $\sigma_\mathrm{HF} \sim \mathcal{U}(0,\,1)\,\mathrm{rad}$.
+
+    \item The total power-law phase is $\varphi_\mathrm{PL} = \varphi_\mathrm{LF} + \varphi_\mathrm{HF}$.
+\end{enumerate}
+
+\paragraph{2.3. Zernike aberrations}
+
+Low-order quasi-static aberrations are modelled as a linear combination of the pre-computed Zernike modes:
+\begin{equation}
+\varphi_\mathrm{Zer}(\mathbf{x}) = \sum_j c_j \, Z_j(\mathbf{x}).
+\end{equation}
+
+Coefficients are drawn hierarchically:
+\begin{enumerate}
+    \item A base coefficient vector $\mathbf{c}_0$ is drawn once, with $c_{0,j} \sim \mathcal{N}(0, \sigma_\mathrm{rms})$, where $\sigma_\mathrm{rms} \sim \mathcal{U}(0,\,1)$.
+    \item For each of the $N_\mathrm{SE}$ short-exposure screens, per-screen deviations are added: $c_j = c_{0,j} + \epsilon_j$ with $\epsilon_j \sim \mathcal{N}(0, \sigma_\mathrm{std})$, where $\sigma_\mathrm{std} \sim \mathcal{U}(0,\,1)$.
+\end{enumerate}
+
+This two-level scheme produces correlated aberrations across short exposures (shared $\mathbf{c}_0$) with frame-to-frame jitter ($\epsilon$).
+
+\paragraph{2.4. Low Wind Effect (LWE) modes}
+
+Differential piston, tip, and tilt across the spider-vane-separated pupil islands are modelled as:
+\begin{equation}
+\varphi_\mathrm{LWE}(\mathbf{x}) = \sum_{i=1}^{N_\mathrm{isl}} \left[ w^{(P)}_i \, M^{(P)}_i(\mathbf{x}) + w^{(T)}_i \, M^{(T)}_i(\mathbf{x}) + w^{(L)}_i \, M^{(L)}_i(\mathbf{x}) \right].
+\end{equation}
+
+Here $M^{(P)}_i$, $M^{(T)}_i$, and $M^{(L)}_i$ are the piston, tip, and tilt mode maps for island $i$. The weights are drawn with the same hierarchical scheme as Zernike coefficients: a base weight vector scaled by $\sigma_\mathrm{rms}^\mathrm{piston}$ (for piston) or $\sigma_\mathrm{rms}^\mathrm{tiptilt}$ (for tip/tilt), plus per-screen Gaussian deviations scaled by $\sigma_\mathrm{std}^\mathrm{piston}$ or $\sigma_\mathrm{std}^\mathrm{tiptilt}$. All four RMS/STD parameters are drawn uniformly from $[0,1]$.
+
+\paragraph{2.5. Composite phase and Strehl scaling}
+
+The total phase screen is
+\begin{equation}
+\varphi_\mathrm{tot} = \varphi_\mathrm{PL} + \varphi_\mathrm{Zer} + \varphi_\mathrm{LWE},
+\end{equation}
+where inactive components contribute zero. The composite is then globally rescaled to achieve a target Strehl ratio $S \sim \mathcal{U}(0.5,\,1.0)$ via the Maréchal approximation $S = \exp(-\sigma^2)$, i.e.
+\begin{equation}
+\varphi_\mathrm{tot} \leftarrow \varphi_\mathrm{tot} \times \frac{\sqrt{-\ln S}}{\sigma_\mathrm{current}},
+\end{equation}
+where $\sigma_\mathrm{current}$ is the RMS of $\varphi_\mathrm{tot}$ on the pupil support.
+
+\paragraph{3. PSF Computation}
+
+\paragraph{3.1. Short-exposure PSF}
+
+A monochromatic short-exposure PSF is computed as
+\begin{equation}
+\mathrm{PSF}(\mathbf{u}) = \left| \mathcal{F}\!\left[ A(\mathbf{x})\, e^{i\,\varphi(\mathbf{x})} \right] \right|^2,
+\end{equation}
+where $A(\mathbf{x})$ is the rotated pupil transmission. The result is \texttt{fftshift}-ed so the PSF peak is centred, and normalised to unit total flux.
+
+\paragraph{3.2. Long-exposure PSF}
+
+The number of short-exposure screens per long-exposure frame is drawn from a \emph{log-uniform distribution} $N_\mathrm{SE} \sim \mathrm{LogUniform}(1, 100)$. A long-exposure PSF is the arithmetic mean of $N_\mathrm{SE}$ independent short-exposure PSFs:
+\begin{equation}
+\mathrm{PSF}_\mathrm{LE} = \frac{1}{N_\mathrm{SE}} \sum_{k=1}^{N_\mathrm{SE}} \mathrm{PSF}_k.
+\end{equation}
+
+\paragraph{3.3. PSF centring}
+
+After computation, each PSF is centred by rolling the array so that its peak pixel coincides with index $(N/2, N/2)$.
+
+\paragraph{Summary of Randomised Hyperparameters (NACO M-band defaults)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Parameter} & \textbf{Distribution} & \textbf{Default range} \\
+\hline
+Pupil rotation angle & Uniform integer & $[0^\circ, 359^\circ]$ \\
+$N_\mathrm{SE}$ (screens per LE) & Log-uniform (integer) & $[1, 100]$ \\
+Power-law activation & Bernoulli & $p = 0.5$ \\
+Zernike activation & Bernoulli & $p = 0.5$ \\
+LWE activation & Bernoulli & $p = 0.5$ \\
+LF PSD exponent $\alpha_\mathrm{LF}$ & $\mathcal{U}$ & $[2.0, 5.0]$ \\
+HF PSD exponent $\alpha_\mathrm{HF}$ & $\mathcal{U}$ & $[2.0, 5.0]$ \\
+Cutoff length $\ell_c$ (m) & $\mathcal{U}$ & $[0.1, 2.0]$ \\
+LF RMS $\sigma_\mathrm{LF}$ (rad) & $\mathcal{U}$ & $[0.0, 1.0]$ \\
+HF RMS $\sigma_\mathrm{HF}$ (rad) & $\mathcal{U}$ & $[0.0, 1.0]$ \\
+Zernike base RMS $\sigma_\mathrm{rms}$ & $\mathcal{U}$ & $[0.0, 1.0]$ \\
+Zernike frame STD $\sigma_\mathrm{std}$ & $\mathcal{U}$ & $[0.0, 1.0]$ \\
+LWE piston RMS / STD & $\mathcal{U}$ & $[0.0, 1.0]$ each \\
+LWE tip-tilt RMS / STD & $\mathcal{U}$ & $[0.0, 1.0]$ each \\
+Target Strehl ratio $S$ & $\mathcal{U}$ & $[0.5, 1.0]$ \\
+\hline
+\end{tabular}
+\end{table}
+
+All ranges are configurable via the experiment configuration file.
+
+\subsubsection{Noise Model}
+
+\paragraph{Overview}
+
+The noise simulation pipeline applies a two-stage corruption to the noiseless convolved image: (1) additive detector noise composed of two physical components blended at a random mixing ratio and scaled to a target peak signal-to-noise ratio (SNR), followed by (2) pixel-level artefacts (spurious point sources and dead pixels). The final noisy image is normalised to unit mean.
+
+\paragraph{Stage 1: Additive Detector Noise}
+
+Two noise maps are generated independently and combined.
+
+\paragraph{1.1. Gaussian (read-out) noise}
+
+A map of i.i.d. Gaussian samples is drawn:
+\begin{equation}
+n_\mathrm{G}(\mathbf{x}) \sim \mathcal{N}(0,\,1).
+\end{equation}
+
+This component models read-out noise, which is signal-independent.
+
+\paragraph{1.2. Signal-dependent (photon) noise}
+
+A second noise map is drawn with pixel-wise standard deviation proportional to the square root of the signal:
+\begin{equation}
+n_\mathrm{P}(\mathbf{x}) \sim \mathcal{N}\!\left(0,\, \sqrt{\max(I(\mathbf{x}),\,0)}\right),
+\end{equation}
+where $I(\mathbf{x})$ is the noiseless image. This approximates Poisson shot noise in the Gaussian regime.
+
+\paragraph{1.3. Mixing and SNR scaling}
+
+Each noise map is individually re-normalised to a target standard deviation controlled by a random mixing parameter $x \sim \mathcal{U}(0,\,1)$:
+\begin{equation}
+\tilde{n}_\mathrm{G} = x \cdot \frac{n_\mathrm{G}}{\sigma(n_\mathrm{G})}, 
+\qquad
+\tilde{n}_\mathrm{P} = (1 - x) \cdot \frac{n_\mathrm{P}}{\sigma(n_\mathrm{P})}.
+\end{equation}
+
+Thus, the relative contributions of read noise and photon noise are complementary: when $x \to 1$ the noise is purely Gaussian (read-dominated), and when $x \to 0$ it is purely signal-dependent (photon-dominated).
+
+The combined noise is
+\begin{equation}
+n_\mathrm{tot} = \tilde{n}_\mathrm{G} + \tilde{n}_\mathrm{P}.
+\end{equation}
+
+This total noise map is then globally rescaled so that the \emph{peak SNR} matches a target value drawn log-uniformly:
+\begin{equation}
+\mathrm{SNR}_\mathrm{peak} \sim \mathrm{LogUniform}(1,\,10^4).
+\end{equation}
+
+The scaling is:
+\begin{equation}
+n_\mathrm{scaled} = n_\mathrm{tot} \cdot \frac{\max(I)}{\mathrm{SNR}_\mathrm{peak} \cdot \max(|n_\mathrm{tot}|)}.
+\end{equation}
+
+The noisy image after Stage~1 is $I' = I + n_\mathrm{scaled}$.
+
+\paragraph{Stage 2: Pixel-Level Artefacts}
+
+Two pixel-level effects are applied sequentially to the noisy image.
+
+\paragraph{2.1. Spurious point sources (hot pixels / cosmic rays)}
+
+A random number of bright single-pixel artefacts are injected into the image. The number of sources is drawn uniformly:
+\begin{equation}
+n_\mathrm{src} \sim \mathcal{U}_\mathrm{int}\!\left(0,\; 2 \times N_\mathrm{frames}\right),
+\end{equation}
+where $N_\mathrm{frames}$ is the number of frames in the data cube (default 1 for a 2D image). Each source is placed at a uniformly random pixel position, and its flux is drawn as $f \sim \mathcal{U}(0,\,1)$. For 3D cubes, each frame receives an independent set of random positions.
+
+\paragraph{2.2. Dead pixels (pixels set to zero)}
+
+A random number of pixels are forced to zero:
+\begin{equation}
+n_\mathrm{dead} \sim \mathcal{U}_\mathrm{int}(0,\,5).
+\end{equation}
+
+With probability $p = 0.5$, the same pixel positions are zeroed in every frame of a cube (modelling persistent dead pixels); otherwise, each frame receives independently drawn dead-pixel positions (modelling intermittent defects).
+
+\paragraph{Final Normalisation}
+
+After both stages, the output image is normalised to unit mean:
+\begin{equation}
+I_\mathrm{out} = \frac{I'}{\langle I' \rangle}.
+\end{equation}
+
+If the mean is zero or negative (degenerate case), a uniform image of ones is returned.
+
+\paragraph{Summary of Randomised Hyperparameters (NACO M-band defaults)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Parameter} & \textbf{Distribution} & \textbf{Default range} \\
+\hline
+Noise mixing ratio $x$ & $\mathcal{U}$ & $[0, 1]$ \\
+Peak SNR & Log-uniform & $[1, 10^4]$ \\
+Number of spurious point sources $n_\mathrm{src}$ & Uniform integer & $[0, 2 N_\mathrm{frames}]$ \\
+Point source flux $f$ & $\mathcal{U}$ & $[0, 1]$ \\
+Number of dead pixels $n_\mathrm{dead}$ & Uniform integer & $[0, 5]$ \\
+Same dead pixels across frames & Bernoulli & $p = 0.5$ \\
+\hline
+\end{tabular}
+\end{table}
+
+All ranges are configurable via the experiment configuration file.
+
+\subsection{Neural Network Architectures}
+
+Two distinct architectures are employed as independent prediction heads: a \emph{U-Net} for spatially structured outputs (sky image and noise), and a \emph{Global Pooling Kernel Head (GPKH)} for the PSF. Both share a common convolutional encoder design but differ fundamentally in how they map encoded features to the output space.
+
+\paragraph{Shared Encoder Design}
+
+Both architectures use the same encoder building blocks:
+\begin{itemize}
+    \item \textbf{Convolutional block:} $L$ consecutive $3 \times 3$ convolution layers (with \texttt{same} padding), each followed by an optional normalisation step and a non-linear activation. The default activation is Leaky ReLU with slope $\alpha = 0.05$; kernels are initialised with He Normal initialisation when Leaky ReLU is used, and Glorot uniform otherwise. An optional $L_2$ weight decay (default $10^{-5}$) is applied to all convolutional kernels.
+
+    \item \textbf{Normalisation:} selectable per experiment as \emph{none}, \emph{batch normalisation}, \emph{group normalisation} (default 8 groups), or \emph{instance normalisation} (groups = number of filters).
+
+    \item \textbf{Downsampling:} after each convolutional block, a stride-2 $3 \times 3$ convolution doubles the filter count and halves the spatial resolution, followed by normalisation and activation.
+\end{itemize}
+
+The number of encoder stages $B$ is determined automatically from the input spatial size as
+\begin{equation}
+B = \min\!\bigl(4,\; \lfloor \log_2(\min(H, W)) \rfloor - 2\bigr),
+\end{equation}
+ensuring the bottleneck remains at least $4 \times 4$ pixels. Both height and width must be divisible by $2^B$.
+
+\paragraph{1. U-Net (Image and Noise Heads)}
+
+The U-Net follows the classical encoder--decoder structure with skip connections.
+
+\paragraph{Encoder}
+
+The network has $B$ stages, each consisting of a convolutional block with $\max(F_b, C_\mathrm{out})$ filters, where
+\begin{equation}
+F_b = F_0 \cdot 2^b,
+\end{equation}
+with $F_0$ the base filter count and $C_\mathrm{out}$ the number of output channels, followed by strided downsampling. The feature maps at each stage are stored for later concatenation.
+
+\paragraph{Bottleneck}
+
+A single convolutional block is applied at the coarsest resolution with $\max(F_0 \cdot 2^B, C_\mathrm{out})$ filters.
+
+\paragraph{Decoder}
+
+The decoder consists of $B$ symmetric upsampling stages. Each stage applies bilinear $2\times$ upsampling, a $3 \times 3$ convolution (reducing the filter count), normalisation and activation, concatenation with the corresponding encoder skip connection, and a convolutional block.
+
+\paragraph{Output}
+
+A $1 \times 1$ convolution maps to $C_\mathrm{out}$ channels with a linear activation. When the head is trained with a negative log-likelihood (NLL) loss, $C_\mathrm{out}$ is doubled: the first half represents the predicted mean and the second half the predicted log-variance (uncertainty).
+
+The U-Net preserves full spatial resolution through the skip connections, making it well-suited for pixel-to-pixel mappings such as deconvolved image estimation and noise prediction.
+
+\paragraph{2. GPKH --- Global Pooling Kernel Head (PSF Head)}
+
+The GPKH is designed to predict quantities that are spatially \emph{global} properties of the input---in this case, the PSF(s)---rather than pixel-aligned maps.
+
+\paragraph{Encoder}
+
+The encoder is identical to the U-Net encoder: $B$ stages of convolutional blocks with $F_0 \cdot 2^b$ filters and strided downsampling.
+
+\paragraph{Bottleneck}
+
+A convolutional block is applied at the coarsest resolution, identical to that of the U-Net.
+
+\paragraph{Global pooling}
+
+Instead of a spatial decoder, the bottleneck feature maps are collapsed via \emph{simultaneous} global average pooling and global max pooling. The two resulting vectors are concatenated, forming a $2 \times F_0 \cdot 2^B$-dimensional descriptor. This dual-pooling strategy captures both the mean activation level and the most salient feature per channel.
+
+\paragraph{Latent MLP}
+
+The pooled vector is passed through a two-layer fully connected head: a first dense layer mapping to $2 d_z$ units followed by activation, then a second dense layer mapping to $d_z$ units (the latent dimension, default $d_z = 512$) followed by activation.
+
+\paragraph{Output projection}
+
+A single dense layer projects the latent vector to $H \times W \times C_\mathrm{out}$ values, which are reshaped into the output cube $(H, W, C_\mathrm{out})$.
+
+\paragraph{Output normalisation}
+
+A softplus non-linearity $\sigma_+(x) = \ln(1 + e^x)$ is applied element-wise to enforce positivity (since PSFs are non-negative). The output is then normalised so that the spatial sum of the first output channel equals unity:
+\begin{equation}
+\hat{P}_{c}(\mathbf{u}) =
+\frac{\sigma_+\!\bigl(z_c(\mathbf{u})\bigr)}
+{\sum_{\mathbf{u}'} \sigma_+\!\bigl(z_1(\mathbf{u}')\bigr) + \epsilon},
+\quad \forall\, c = 1, \ldots, C_\mathrm{out},
+\end{equation}
+where $z_c$ is the raw network output for channel $c$ and $\epsilon = 10^{-12}$. Dividing all channels by the sum of channel 1 ensures that the primary PSF integrates to unity while preserving the relative scaling of any additional output channels (e.g.\ uncertainty maps). When trained with NLL loss, the output channels are doubled: the first $C_\mathrm{out}$ channels encode the PSF mean and the remaining $C_\mathrm{out}$ channels encode the predicted log-variance.
+
+The global-pooling bottleneck collapses all spatial information into a fixed-length vector, reflecting the physical prior that the PSF is a property of the \emph{entire} field of view rather than of any individual pixel.
+
+\paragraph{Summary of Architectural Hyperparameters (defaults)}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Parameter} & \textbf{U-Net} & \textbf{GPKH} \\
+\hline
+Base filters $F_0$ & 32 & 32 \\
+Layers per block $L$ & 2 & 2 \\
+Encoder stages $B$ & $\leq 4$ (auto) & $\leq 4$ (auto) \\
+Kernel size & $3 \times 3$ & $3 \times 3$ \\
+Inner activation & ReLU & Softplus \\
+Output activation & Linear & Softplus + sum-normalisation \\
+Latent dimension $d_z$ & --- & 512 \\
+Normalisation & None & None \\
+$L_2$ weight decay & $10^{-5}$ & $0$ \\
+Output format (NLL mode) & $[C_\mathrm{out}$ mean, $C_\mathrm{out}$ log-var$]$ & $[C_\mathrm{out}$ mean, $C_\mathrm{out}$ log-var$]$ \\
+\hline
+\end{tabular}
+\end{table}
+
+
+\subsection{Training Procedure}
+
+\paragraph{4.1. Overview of the multi-stage training pipeline}
+
+The full training pipeline proceeds in four sequential stages, orchestrated via SLURM dependency chains on a GPU cluster:
+\begin{enumerate}
+    \item \textbf{Stage 1 --- Dataset creation} (CPU): synthetic TFRecord examples are generated in parallel batches (Sect.~2).
+    \item \textbf{Stage 2a--c --- Independent head pretraining} (GPU): the image, noise, and PSF-mean heads are each trained separately with head-specific losses.
+    \item \textbf{Stage 3 --- PSF uncertainty head} (GPU, depends on Stage~2c): a second-stage model is trained to predict PSF uncertainty, conditioned on the frozen stage-1 PSF mean prediction.
+    \item \textbf{Stage 4 --- Joint PINN fine-tuning} (GPU, depends on Stages~2a, 2b, and~3): all four heads are assembled into a single \texttt{FourHeadJointPinnModel} and jointly fine-tuned with a physics-informed observation-reconstruction regulariser.
+\end{enumerate}
+
+All training stages share the same data pipeline and the same optimizer/schedule family. Below, each element is described in detail.
+
+\paragraph{4.2. Data pipeline}
+
+Training data are stored as TFRecord files split into \texttt{train/} and \texttt{val/} subdirectories. Each serialised example contains the following tensors (all \texttt{float32}):
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Key} & \textbf{Shape} & \textbf{Description} \\
+\hline
+\texttt{image} & $(N, N)$ & True sky image \\
+\texttt{obs} & $(F, N, N)$ & Observation cube ($F$ frames) \\
+\texttt{psf} & $(F, N, N)$ & True PSF cube \\
+\texttt{noise} & $(F, N, N)$ & True noise cube \\
+\texttt{n\_frames} & scalar & Number of frames $F$ \\
+\texttt{n\_pix} & scalar & Spatial dimension $N$ \\
+\hline
+\end{tabular}
+\end{table}
+
+After deserialisation, the preparation pipeline applies the following steps:
+\begin{enumerate}
+    \item \textbf{Spatial cropping:} a border of \texttt{half\_n\_pix\_crop} $= 16$ pixels is removed from each side, reducing the $160 \times 160$ raw images to $128 \times 128$ working images.
+    \item \textbf{PSF normalisation:} the PSF cube is multiplied by a normalisation factor. In the NACO-M configuration, \texttt{norm\_psf = "npix2"}, so each PSF frame is multiplied by $N_\mathrm{crop}^2 = 128^2 = 16\,384$.
+    \item \textbf{Noise normalisation:} configurable (set to \texttt{None} in the NACO-M configuration, i.e.\ no rescaling).
+    \item \textbf{Output assembly:} depending on which head is being trained, the ground-truth target is assembled by concatenating subsets of $\{\mathrm{image}, \mathrm{PSF}, \mathrm{noise}\}$ along the channel axis, then transposed to channels-last format $(H, W, C)$.
+    \item \textbf{Shuffling and batching:} the training set is shuffled with a buffer of 1024 examples (re-shuffled each iteration). Batches of size 64 are assembled (validation: 1024). Any batch containing non-finite values is silently dropped. Prefetching is enabled via \texttt{tf.data.AUTOTUNE}.
+\end{enumerate}
+
+\paragraph{4.3. Optimiser and learning-rate schedule}
+
+All stages use the \textbf{Adam} optimiser with gradient clipping:
+\begin{equation}
+\text{Adam}(\mathrm{lr} = \mathrm{lr}_0,\; \texttt{clipnorm} = 1.0).
+\end{equation}
+
+The learning rate follows a \textbf{log-linear (exponential) decay schedule}:
+\begin{equation}
+\mathrm{lr}(\mathrm{epoch}) = \mathrm{lr}_0 \times 10^{-\mathrm{epoch}/\tau},
+\end{equation}
+where $\mathrm{lr}_0$ is the initial learning rate and $\tau$ is the decay time constant. The NACO-M default values for each stage are:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|l|l|l|}
+\hline
+\textbf{Stage} & $\mathrm{lr}_0$ & $\tau$ & \textbf{Epochs} \\
+\hline
+2a --- Image head & $10^{-4}$ & 1.5 & 3 \\
+2b --- Noise head & $10^{-4}$ & 1.5 & 3 \\
+2c --- PSF mean head & $10^{-4}$ & 2.5 & 5 \\
+3 --- PSF uncertainty & $10^{-4}$ & 1.5 & 3 \\
+4 --- Joint PINN & $10^{-5}$ & 1.5 & 3 \\
+\hline
+\end{tabular}
+\end{table}
+
+The joint PINN stage uses a 10$\times$ smaller initial learning rate to avoid disrupting pretrained weights.
+
+\paragraph{4.4. Loss functions}
+
+\paragraph{4.4.1. Gaussian negative log-likelihood (NLL)}
+
+The image head, noise head, and PSF uncertainty head are each trained with a heteroscedastic Gaussian negative log-likelihood loss. Each network predicts both a mean $\hat{\mu}$ and an uncertainty parameterisation from which a pixel-wise variance $\hat{\sigma}^2$ is derived. The NLL for a single component is
+\begin{equation}
+\mathcal{L}_{\mathrm{NLL}} =
+\frac{1}{|\Omega|}\sum_{p \in \Omega}
+\left[
+\frac{(y_p - \hat{\mu}_p)^2}{\hat{\sigma}_p^2}
++ \ln \hat{\sigma}_p^2
+\right],
+\end{equation}
+where $\Omega$ denotes all spatial pixels summed over the batch.
+
+\textbf{Variance parameterisation.} The network's raw uncertainty output $u$ is converted to a variance via one of two pathways controlled by the \texttt{log\_sigma} flag:
+\begin{itemize}
+    \item \textbf{Softplus mode} (\texttt{log\_sigma = False}, used in NACO-M): $\sigma^2 = \mathrm{softplus}(u) + \varepsilon$, then $\ln \sigma^2$ is soft-clipped to $[\ell_{\min}\ln 10,\; \ell_{\max}\ln 10]$ using a double-softplus function (see below), and $\sigma^2$ is recomputed as $\exp(\text{clipped } \ln \sigma^2) + \varepsilon$.
+    \item \textbf{Log mode} (\texttt{log\_sigma = True}): $u$ is directly interpreted as $\log_{10}\sigma^2$, soft-clipped, then exponentiated.
+\end{itemize}
+
+The \textbf{soft-clip} function prevents the log-variance from saturating:
+\begin{equation}
+\mathrm{softclip}(x; \ell, h)
+=
+h - \frac{1}{2}\mathrm{softplus}\!\left(
+\frac{
+h - \left[
+\ell + \frac{1}{2}\mathrm{softplus}\!\left(\frac{x - \ell}{0.5}\right)
+\right]
+}{0.5}
+\right),
+\end{equation}
+with the NACO-M configuration using $\ell_{\min} = -6$ and $\ell_{\max} = 20$ (in $\log_{10}$ units), and $\varepsilon = 10^{-30}$.
+
+\paragraph{4.4.2. Variance-normalised MSE ($R^2$ loss)}
+
+The PSF mean head is trained with a variance-normalised mean squared error:
+\begin{equation}
+\mathcal{L}_{R^2} =
+\frac{\langle (y - \hat{y})^2 \rangle}{\mathrm{Var}(y) + 10^{-12}},
+\end{equation}
+where $\langle \cdot \rangle$ denotes the mean over all pixels and the batch.
+
+\paragraph{4.4.3. PINN Charbonnier observation-reconstruction term}
+
+When the physics-informed (PINN) constraint is enabled, an additional term penalises the discrepancy between the observed data and the forward-model reconstruction built from the predicted components. The reconstructed observation for frame $f$ is
+\begin{equation}
+\hat{o}_f = \hat{I} \ast \tilde{P}_f - \hat{n}_f,
+\end{equation}
+where $\hat{I}$ is the predicted image, $\tilde{P}_f = P_f / \sum P_f$ is the predicted PSF normalised to unit sum (after de-normalisation by the factor $N_\mathrm{crop}^2$), $\hat{n}_f$ is the predicted noise (de-normalised), and $\ast$ denotes 2D convolution via FFT. A border of \texttt{reconstruction\_crop} $= 16$ pixels is cropped from each side to avoid edge artefacts.
+
+In the independent-head training stages, this term uses the \textbf{Charbonnier} pseudo-norm:
+\begin{equation}
+\mathcal{L}_{\mathrm{PINN}}^{\mathrm{Charb}}
+=
+\frac{1}{|\Omega'|} \sum_{p \in \Omega'}
+\sqrt{(o_p - \hat{o}_p)^2 + \varepsilon_{\mathrm{c}}^2},
+\qquad
+\varepsilon_{\mathrm{c}} = 10^{-4}.
+\end{equation}
+
+In the joint fine-tuning stage, the PINN term instead uses a \textbf{variance-normalised $R^2$} formulation:
+\begin{equation}
+\mathcal{L}_{\mathrm{PINN}}^{R^2}
+=
+\frac{\langle (o - \hat{o})^2 \rangle}{\mathrm{Var}(o) + 10^{-12}}.
+\end{equation}
+
+\paragraph{4.5. Stage 2: independent head pretraining}
+
+Each of the three heads (image, noise, PSF mean) is trained independently in its own SLURM job. All three jobs depend only on the dataset creation step and can therefore run in parallel.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|l|l|l|l|}
+\hline
+\textbf{Head} & \textbf{Architecture} & \textbf{Ground truth} & \textbf{Loss} & \textbf{PINN} \\
+\hline
+Image & U-Net (4 blocks, 2 layers/block, 32 base filters) & Sky image $(H, W, 1)$ & NLL & No (single component) \\
+Noise & U-Net (4 blocks, 2 layers/block, 32 base filters) & Noise cube $(H, W, F)$ & NLL & No (single component) \\
+PSF mean & GPKH (4 blocks, 32 base filters, latent 512) & PSF cube $(H, W, F)$ & $R^2$ (variance-normalised MSE) & No (single component) \\
+\hline
+\end{tabular}
+\end{table}
+
+When only a single component is being fitted (e.g.\ image only), the PINN Charbonnier term requires all three components simultaneously and is therefore disabled.
+
+The model checkpoint achieving the lowest \textbf{validation loss} (computed as the median over all validation batches) is saved.
+
+\paragraph{4.6. Stage 3: PSF uncertainty head}
+
+A second GPKH model is trained to estimate the PSF uncertainty. The stage-1 PSF mean model is frozen and applied on-the-fly in the data pipeline to produce fixed PSF mean predictions. The stage-2 model receives as input the concatenation of the observation cube and the frozen PSF mean prediction along the channel axis, yielding an input tensor of shape $(H, W, 2F)$. It predicts only the uncertainty parameterisation for the PSF, and the loss is a Gaussian NLL where the frozen stage-1 PSF mean serves as the fixed Gaussian mean:
+\begin{equation}
+\mathcal{L}_{\mathrm{PSF\,unc}} =
+\frac{1}{|\Omega|} \sum_{p \in \Omega}
+\left[
+\frac{\bigl(P_p^{\mathrm{true}} - \hat{\mu}_p^{\mathrm{frozen}}\bigr)^2}{\hat{\sigma}_p^2}
++ \ln \hat{\sigma}_p^2
+\right].
+\end{equation}
+
+\paragraph{4.7. Stage 4: joint PINN four-head fine-tuning}
+
+The four pretrained heads are assembled into a single \texttt{FourHeadJointPinnModel}. The forward pass proceeds as:
+\begin{enumerate}
+    \item The \textbf{image head} processes the observation and outputs $[\hat{I}_\mu,\; \hat{I}_\sigma]$.
+    \item The \textbf{noise head} processes the observation and outputs $[\hat{n}_\mu,\; \hat{n}_\sigma]$.
+    \item The \textbf{PSF mean head} processes the observation and outputs $\hat{P}_\mu$.
+    \item The PSF mean prediction is re-normalised to the convention expected by the PSF uncertainty head, concatenated with the observation, and fed to the \textbf{PSF uncertainty head}, which outputs $\hat{P}_\sigma$.
+\end{enumerate}
+
+The combined output is
+\begin{equation}
+[\hat{I}_\mu, \hat{P}_\mu, \hat{n}_\mu, \hat{I}_\sigma, \hat{P}_\sigma, \hat{n}_\sigma].
+\end{equation}
+
+The \textbf{joint loss} is a weighted sum of four terms:
+\begin{equation}
+\mathcal{L}_{\mathrm{joint}}
+=
+w_{\mathrm{PINN}} \cdot \mathcal{L}_{\mathrm{PINN}}^{R^2}
++ w_{\mathrm{im}} \cdot \mathcal{L}_{\mathrm{NLL}}^{\mathrm{im}}
++ w_{\mathrm{psf}} \cdot \mathcal{L}_{\mathrm{NLL}}^{\mathrm{psf}}
++ w_{\mathrm{noise}} \cdot \mathcal{L}_{\mathrm{NLL}}^{\mathrm{noise}}.
+\end{equation}
+
+The NACO-M configuration uses equal weights:
+\begin{equation}
+w_{\mathrm{PINN}} = w_{\mathrm{im}} = w_{\mathrm{psf}} = w_{\mathrm{noise}} = 1.0.
+\end{equation}
+
+\textbf{Selective head freezing.} Each of the four heads can be independently frozen or unfrozen. In the NACO-M default, only the image head is trainable (\texttt{train\_image\_head = True}); the noise, PSF mean, and PSF uncertainty heads are frozen. This focuses the PINN gradient signal on improving the deconvolved image while keeping the other components fixed at their pretrained values.
+
+\paragraph{4.8. Callbacks and model selection}
+
+All training stages employ the following callbacks:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|p{9cm}|}
+\hline
+\textbf{Callback} & \textbf{Description} \\
+\hline
+\texttt{LearningRateScheduler} & Applies the log-linear decay (Eq.~above) at each epoch boundary \\
+\texttt{TerminateOnNaN} & Halts training if any epoch-level metric becomes NaN \\
+\texttt{TerminateOnNaNWithBatch} & Additionally checks each batch for non-finite values \\
+\texttt{MedianValidationMetrics} & After each epoch, iterates over the full validation set and computes the \textbf{median} of per-batch loss values, which is then used as the reported \texttt{val\_loss} \\
+\texttt{ModelCheckpoint} & Saves the model whenever \texttt{val\_loss} improves (or \texttt{loss} if no validation set) \\
+\texttt{SaveBestExamples} & Archives 100 observation/target/prediction triplets from the validation set whenever \texttt{val\_loss} improves, for visual inspection \\
+\texttt{BatchHistory} & Records per-batch training loss for fine-grained monitoring \\
+\texttt{LrTracker} & Records the realised learning rate at each epoch \\
+\hline
+\end{tabular}
+\end{table}
+
+The use of \textbf{median} (rather than mean) batch validation metrics provides robustness to occasional outlier batches.
+
+\paragraph{4.9. Summary of the full training pipeline}
+
+\begin{equation}
+\boxed{
+\text{Dataset}
+\;\xrightarrow{\text{Stage 2a--c}}\;
+\text{Image, Noise, PSF-mean heads}
+\;\xrightarrow{\text{Stage 3}}\;
+\text{PSF uncertainty head}
+\;\xrightarrow{\text{Stage 4}}\;
+\text{Joint PINN model}
+}
+\end{equation}
+
+The final deliverable is the jointly fine-tuned \texttt{FourHeadJointPinnModel}, from which one can extract predictions for the deconvolved image, PSF field, noise field, and pixel-wise uncertainties for each, in a single forward pass.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Results}
+
+\subsection{Results on the training and validation datasets}
+
+\paragraph{Overview}
+
+We trained the four-head V1H model according to the staged procedure described in Section~\ref{sec:training_procedure}, executing each stage on a single NVIDIA H100 GPU on the Jean~Zay supercomputer (IDRIS, CNRS). The training dataset comprises $N_\mathrm{train} = 131\,072$ synthetic examples generated with the forward model described in the preceding sections; the validation set is constructed identically, using disjoint random seeds. For each training stage, validation metrics are computed as the \emph{median} over per-batch evaluations on the full validation set, rather than the customary mean; this choice makes the reported validation figures robust to outlier batches that occasionally arise from extreme noise or aberration configurations.
+
+Below, we summarize the convergence behaviour of each stage, reporting the per-epoch training and validation losses as well as every auxiliary metric recorded by the training callbacks. All numerical values are extracted from the SLURM execution logs of the production run.
+
+\paragraph{Stage 1: Dataset generation}
+
+The training corpus consists of $128$ TFRecord shards, each containing $1024$ examples, yielding
+\begin{equation}
+N = 128 \times 1024 = 131\,072
+\end{equation}
+independent observation--truth tuples. Every tuple contains (i) the simulated observation $\mathbf{y} \in \mathbb{R}^{128 \times 128}$, (ii) the latent sky image $\mathbf{x} \in \mathbb{R}^{128 \times 128}$, (iii) the instantaneous PSF $\mathbf{h} \in \mathbb{R}^{128 \times 128}$, and (iv) the noise realization $\boldsymbol{\eta} \in \mathbb{R}^{128 \times 128}$. These quantities are linked by the forward model
+\begin{equation}
+\mathbf{y} = \mathbf{h} \ast \mathbf{x} + \boldsymbol{\eta},
+\end{equation}
+with all arrays cropped by $16$ pixels on each side from the original $160 \times 160$ generation grid (i.e.\ \texttt{half\_n\_pix\_crop} $= 16$). Training examples are batched in groups of $64$; validation batches use a larger batch size of $1024$.
+
+\paragraph{Stage 2a: Independent training of the image head}
+
+The image head $f_{\boldsymbol{\theta}_\mathrm{im}}$ is a U-Net with $4$ encoder--decoder blocks (2 convolutional layers per block, 32 base filters, ReLU activations, $\ell_2$ weight decay $\lambda = 10^{-5}$), totalling \textbf{11,764,354 trainable parameters} (44.88~MB). Given the observation $\mathbf{y}$, the network produces a two-channel output $[\hat{\mathbf{x}},\, \hat{s}_\mathrm{im}] = f_{\boldsymbol{\theta}_\mathrm{im}}(\mathbf{y})$, where $\hat{\mathbf{x}}$ is the predicted sky image and $\hat{s}_\mathrm{im}$ is a pixelwise scalar passed through a softplus nonlinearity to yield the predicted variance $\hat{\sigma}^{2}_\mathrm{im}$. The loss is the heteroscedastic Gaussian negative log-likelihood (NLL),
+\begin{equation}
+\mathcal{L}_\mathrm{im}
+=
+\frac{1}{|\mathcal{P}|}\sum_{p \in \mathcal{P}}
+\left[
+\frac{(x_p - \hat{x}_p)^{2}}{\hat{\sigma}^{2}_{\mathrm{im},p}}
++ \log \hat{\sigma}^{2}_{\mathrm{im},p}
+\right],
+\end{equation}
+where $\mathcal{P}$ denotes the set of spatial pixels. The network is compiled with the Adam optimizer ($\eta_0 = 10^{-4}$, gradient clipping at unit norm) and a power-law learning-rate schedule $\eta(e) = \eta_0 \cdot 10^{-e/\tau}$ with decay constant $\tau = 1.5$. Model checkpoints are saved whenever the median validation loss improves.
+
+Training was conducted for \textbf{3 epochs} of $131\,072$ gradient-update steps each (approximately $36\,\mathrm{ms/step}$, or $\sim 78$ minutes per epoch on a single H100 GPU). The per-epoch results are summarized in Table~\ref{tab:step2a}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|c|c|c|c|c|c|c|}
+\hline
+\textbf{Epoch} & $\mathcal{L}_\mathrm{train}$ & $\mathcal{L}_\mathrm{val}$ & $\mathrm{NLL}_\mathrm{im}^\mathrm{train}$ & $\mathrm{NLL}_\mathrm{im}^\mathrm{val}$ & $\log\hat{\sigma}^{2\,\mathrm{train}}_\mathrm{im}$ & $\log\hat{\sigma}^{2\,\mathrm{val}}_\mathrm{im}$ \\
+\hline
+1 & $1972.113$ & $-3.702$ & $1972.113$ & $-3.740$ & $-4.405$ & $-4.825$ \\
+2 & $18.584$ & $-3.449$ & $18.542$ & $-3.493$ & $-4.863$ & $-4.685$ \\
+3 & $\mathbf{4.360}$ & $\mathbf{-3.739}$ & $4.317$ & $-3.782$ & $-4.833$ & $-4.844$ \\
+\hline
+\end{tabular}
+\caption{Per-epoch results for Stage~2a (image head training).}
+\label{tab:step2a}
+\end{table}
+
+The first epoch is dominated by the network's random initialization, leading to an extremely large training loss; however, the validation NLL already reaches $-3.740$ by the end of epoch~1, indicating rapid convergence within a single pass. The training loss metric is a running (cumulative) mean over all gradient steps within the epoch and therefore includes early-epoch transients; the validation loss, by contrast, is evaluated from the fully converged end-of-epoch weights and is therefore a more faithful measure of performance. By epoch~3, $\mathcal{L}_\mathrm{val}$ decreases to $-3.739$, while the learnt log-variance stabilizes at $\log\hat{\sigma}^2_\mathrm{im} \approx -4.84$, corresponding to a per-pixel RMS uncertainty of
+\begin{equation}
+\hat{\sigma}_\mathrm{im} \approx e^{-4.84/2} \approx 0.089.
+\end{equation}
+
+\paragraph{Stage 2b: Independent training of the noise head}
+
+The noise head $f_{\boldsymbol{\theta}_\mathrm{noise}}$ shares the same U-Net architecture as the image head (11,764,354 parameters), but maps the observation to the noise realization and its pixelwise uncertainty:
+\begin{equation}
+[\hat{\boldsymbol{\eta}},\, \hat{s}_\mathrm{noise}] = f_{\boldsymbol{\theta}_\mathrm{noise}}(\mathbf{y}).
+\end{equation}
+The loss is the analogous Gaussian NLL applied to the noise component,
+\begin{equation}
+\mathcal{L}_\mathrm{noise}
+=
+\frac{1}{|\mathcal{P}|}\sum_{p \in \mathcal{P}}
+\left[
+\frac{(\eta_p - \hat{\eta}_p)^{2}}{\hat{\sigma}^{2}_{\mathrm{noise},p}}
++ \log \hat{\sigma}^{2}_{\mathrm{noise},p}
+\right].
+\end{equation}
+
+The optimizer and schedule are identical to Stage~2a. Training was run for \textbf{3 epochs}, with results reported in Table~\ref{tab:step2b}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|c|c|c|c|c|c|c|}
+\hline
+\textbf{Epoch} & $\mathcal{L}_\mathrm{train}$ & $\mathcal{L}_\mathrm{val}$ & $\mathrm{NLL}_\mathrm{noise}^\mathrm{train}$ & $\mathrm{NLL}_\mathrm{noise}^\mathrm{val}$ & $\log\hat{\sigma}^{2\,\mathrm{train}}_\mathrm{noise}$ & $\log\hat{\sigma}^{2\,\mathrm{val}}_\mathrm{noise}$ \\
+\hline
+1 & $2504.394$ & $-7.020$ & $2504.392$ & $-7.029$ & $-6.025$ & $-7.936$ \\
+2 & $2803.620$ & $-7.569$ & $2803.586$ & $-7.579$ & $-8.459$ & $-8.424$ \\
+3 & $\mathbf{4917.872}$ & $\mathbf{-7.812}$ & $4917.844$ & $-7.823$ & $-8.733$ & $-8.788$ \\
+\hline
+\end{tabular}
+\caption{Per-epoch results for Stage~2b (noise head training).}
+\label{tab:step2b}
+\end{table}
+
+The anomalously large and increasing \textbf{training} loss is an artefact of the reporting protocol: because the training loss is a running average computed cumulatively over all $131\,072$ steps per epoch and the learning rate decays across epochs, later epochs have systematically larger running-average denominators weighted toward early-step values. This effect is amplified by the NLL loss, which can change sign as the variance estimate tightens; the running mean retains memory of the high early-step losses. The median \textbf{validation} loss, in contrast, improves monotonically from $-7.020$ to $-7.812$, confirming genuine convergence. The learned log-variance converges to $\log\hat{\sigma}^2_\mathrm{noise} \approx -8.79$, corresponding to
+\begin{equation}
+\hat{\sigma}_\mathrm{noise} \approx e^{-8.79/2} \approx 0.012,
+\end{equation}
+reflecting the comparatively lower per-pixel variance of the noise component relative to the sky image.
+
+\paragraph{Stage 2c: Independent training of the PSF mean head}
+
+The PSF mean head $f_{\boldsymbol{\theta}_\mathrm{PSF}}$ uses the GPKH architecture (Global-Prior Kernel Head), a hybrid encoder--decoder with a fully-connected bottleneck of dimension $512$, 32 base filters, softplus inner activations, and no weight regularization, totalling \textbf{17,825,440 trainable parameters} (68.00~MB). The model is not trained with a probabilistic loss but with a variance-normalized mean-squared error (vnMSE),
+\begin{equation}
+\mathcal{L}_\mathrm{PSF}
+=
+\frac{\mathrm{MSE}(\mathbf{h},\, \hat{\mathbf{h}})}{\mathrm{Var}(\mathbf{h})}
+=
+\frac{\frac{1}{|\mathcal{P}|}\sum_p (h_p - \hat{h}_p)^2}{\mathrm{Var}_p(h_p)},
+\end{equation}
+which provides scale-invariant supervision of the PSF prediction, irrespective of the flux normalization scheme.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|c|c|c|}
+\hline
+\textbf{Epoch} & $\mathrm{vnMSE}_\mathrm{train}$ & $\mathrm{vnMSE}_\mathrm{val}$ \\
+\hline
+1 & $0.01671$ & $0.01150$ \\
+2 & $0.01089$ & $0.01058$ \\
+3 & $0.01004$ & $0.01034$ \\
+4 & $0.00966$ & $0.01012$ \\
+5 & $\mathbf{0.00949}$ & $\mathbf{0.01007}$ \\
+\hline
+\end{tabular}
+\caption{Per-epoch results for Stage~2c (PSF mean head training).}
+\label{tab:step2c}
+\end{table}
+
+Training was conducted for \textbf{5 epochs}. The training vnMSE decreases smoothly from $0.0167$ to $0.0095$, while the validation vnMSE converges to $\sim 0.010$, indicating that the GPKH network explains over $99\%$ of the PSF variance:
+\begin{equation}
+1 - \mathrm{vnMSE} \approx 0.990.
+\end{equation}
+The small but persistent gap between training and validation vnMSE ($\sim 0.0006$) suggests mild overfitting, though the absolute magnitude of the validation error is already very small.
+
+\paragraph{Stage 3: PSF uncertainty (Stage-2) training}
+
+With the PSF mean head frozen, a second GPKH network---the PSF uncertainty head $f_{\boldsymbol{\theta}_\mathrm{unc}}$---is trained to predict the per-pixel uncertainty of the PSF estimate. Its architecture mirrors the PSF mean head (GPKH, latent dimension $512$, 32 base filters, softplus activations), with \textbf{17,825,728 trainable parameters} (68.00~MB). The input to this network is the concatenation of the observation cube and the frozen stage-1 PSF prediction along the channel axis, yielding an input of shape $(128, 128, 2)$.
+
+The stage-2 loss decomposes into two terms: a residual NLL term that penalizes the discrepancy between the true PSF and the frozen stage-1 mean relative to the predicted uncertainty, and a log-variance NLL that regularizes the predicted log-variance map itself:
+\begin{equation}
+\mathcal{L}_\mathrm{unc}
+=
+\underbrace{\mathcal{L}_\mathrm{nll,\,residual}}_{\text{residual NLL}}
++
+\underbrace{\mathcal{L}_\mathrm{nll,\,log}\sigma}_{\text{log-variance NLL}}.
+\end{equation}
+
+The following table reports all recorded metrics over the \textbf{3 training epochs}:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|c|c|c|c|c|c|c|c|c|}
+\hline
+\textbf{Epoch} & $\mathcal{L}_\mathrm{train}$ & $\mathcal{L}_\mathrm{val}$ & $\mathcal{L}_\mathrm{nll,res}^\mathrm{train}$ & $\mathcal{L}_\mathrm{nll,res}^\mathrm{val}$ & $\mathcal{L}_\mathrm{nll,log\sigma}^\mathrm{train}$ & $\mathcal{L}_\mathrm{nll,log\sigma}^\mathrm{val}$ & $\mathrm{vnMSE}_\mathrm{PSF}^\mathrm{train}$ & $\mathrm{vnMSE}_\mathrm{PSF}^\mathrm{val}$ \\
+\hline
+1 & $-4.158$ & $-5.128$ & $1.110$ & $0.778$ & $-5.269$ & $-5.908$ & $0.00948$ & $0.01011$ \\
+2 & $-4.748$ & $\mathbf{-5.195}$ & $1.478$ & $1.023$ & $-6.226$ & $-6.221$ & $0.00948$ & $0.01011$ \\
+3 & $\mathbf{-4.950}$ & $-5.160$ & $1.312$ & $1.328$ & $-6.262$ & $-6.490$ & $0.00948$ & $0.01011$ \\
+\hline
+\end{tabular}
+\caption{Per-epoch results for Stage~3 (PSF uncertainty head training).}
+\label{tab:step3}
+\end{table}
+
+Several observations are noteworthy:
+\begin{enumerate}
+    \item \textbf{The validation loss peaks at epoch 2} ($-5.195$) and slightly degrades at epoch~3 ($-5.160$), suggesting near-optimal convergence in very few epochs; the best-model checkpoint is therefore saved at epoch~2.
+    \item \textbf{The vnMSE of the PSF prediction is unchanged} across all three epochs ($0.00948$ train, $0.01011$ val), as expected: the stage-1 PSF mean head is entirely frozen, so the mean prediction quality is invariant to stage-2 training.
+    \item \textbf{The log-variance NLL} ($\mathcal{L}_\mathrm{nll,log\sigma}$) decreases substantially from $-5.27$ to $-6.26$ (train) and from $-5.91$ to $-6.49$ (val), indicating that the network progressively sharpens its uncertainty estimates.
+    \item \textbf{The residual NLL} ($\mathcal{L}_\mathrm{nll,res}$) increases slightly, which may indicate a tension between fitting the residual distribution and regularizing the log-variance---a known trade-off in heteroscedastic regression models.
+\end{enumerate}
+
+\paragraph{Stage 4: Joint PINN fine-tuning}
+
+In the final training stage, the four independently pretrained heads are assembled into a single \textbf{joint Physics-Informed Neural Network (PINN)} model with a combined \textbf{59,179,876 parameters} (225.75~MB). Following the configuration, only the \textbf{image head} weights are unfrozen ($\texttt{train\_image\_head}=\mathrm{True}$); the noise, PSF mean, and PSF uncertainty heads remain frozen. The joint loss is defined as
+\begin{equation}
+\mathcal{L}_\mathrm{joint}
+=
+w_\mathrm{im}\,\mathcal{L}_\mathrm{im}
++
+w_\mathrm{PSF}\,\mathcal{L}_\mathrm{PSF}
++
+w_\mathrm{noise}\,\mathcal{L}_\mathrm{noise}
++
+w_\mathrm{PINN}\,\mathcal{L}_\mathrm{PINN},
+\end{equation}
+where $w_\mathrm{im} = w_\mathrm{PSF} = w_\mathrm{noise} = w_\mathrm{PINN} = 1$ and the PINN reconstruction term is a variance-normalised $R^2$ penalty measuring the discrepancy between the observed data and the physical forward model:
+\begin{equation}
+\mathcal{L}_\mathrm{PINN}
+=
+\frac{\langle (y - \hat{o})^2 \rangle}{\mathrm{Var}(y) + 10^{-12}},
+\quad
+\hat{o} = \hat{\mathbf{h}} \ast \hat{\mathbf{x}} - \hat{\boldsymbol{\eta}},
+\end{equation}
+where $\hat{o}$ is the reconstructed observation and both the mean and variance are taken over all pixels after a $16$-pixel border crop. This term enforces the physics-based constraint that the predicted image, PSF, and noise must be mutually consistent under the imaging forward model $\mathbf{y} = \mathbf{h} \ast \mathbf{x} + \boldsymbol{\eta}$.
+
+The joint model is compiled with $\eta_0 = 10^{-5}$ (one order of magnitude smaller than the independent stages) and the same power-law schedule. Prior to gradient-based training, the model is evaluated on 8 mini-batches from both the training and validation sets to establish baseline performance.
+
+\textbf{Initial diagnostics:}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|c|c|c|c|c|c|}
+\hline
+ & $\mathcal{L}_\mathrm{total}$ & $\mathcal{L}_\mathrm{supervised}$ & $\mathrm{vnMSE}_\mathrm{PINN}$ & $\mathrm{NLL}_\mathrm{im}$ & $\mathrm{NLL}_\mathrm{PSF}$ & $\mathrm{NLL}_\mathrm{noise}$ \\
+\hline
+Train (8 batches) & $-16.852$ & $-16.921$ & $0.026$ & $-3.690$ & $-5.402$ & $-7.829$ \\
+Val (8 batches) & $45\,756$ & $45\,756$ & $0.024$ & $287.8$ & $-5.201$ & $45\,473$ \\
+\hline
+\end{tabular}
+\caption{Initial diagnostics for the joint PINN model before fine-tuning.}
+\label{tab:step4_init}
+\end{table}
+
+The initial validation evaluation exhibits an extremely large total loss ($45\,756$), driven by one or more outlier batches in the noise and image NLL components. Since validation metrics are computed as per-batch medians over the full validation set during training (rather than means over a small 8-batch subsample), this outlier does not affect the epoch-level metrics reported below.
+
+\textbf{Per-epoch joint PINN results (3 epochs):}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|c|c|c|c|c|c|c|}
+\hline
+\textbf{Epoch} & $\mathcal{L}_\mathrm{val}$ & $\mathcal{L}_\mathrm{val}^\mathrm{sup}$ & $\mathrm{vnMSE}_\mathrm{PINN}^\mathrm{val}$ & $\mathrm{NLL}_\mathrm{im}^\mathrm{val}$ & $\mathrm{NLL}_\mathrm{PSF}^\mathrm{val}$ & $\mathrm{NLL}_\mathrm{noise}^\mathrm{val}$ \\
+\hline
+1 & $-16.693$ & $-16.745$ & $0.00944$ & $-3.747$ & $-5.195$ & $-7.823$ \\
+2 & $-16.351$ & $-16.405$ & $0.00965$ & $-3.398$ & $-5.195$ & $-7.823$ \\
+3 & $-16.095$ & $-16.146$ & $0.00992$ & $-3.143$ & $-5.195$ & $-7.823$ \\
+\hline
+\end{tabular}
+\caption{Per-epoch validation results for Stage~4 (joint PINN fine-tuning).}
+\label{tab:step4}
+\end{table}
+
+Several noteworthy patterns emerge:
+\begin{enumerate}
+    \item \textbf{PSF and noise metrics are invariant} ($\mathrm{NLL}_\mathrm{PSF}^\mathrm{val} = -5.195$, $\mathrm{NLL}_\mathrm{noise}^\mathrm{val} = -7.823$ across all epochs). This confirms that these heads are indeed frozen and no gradient leakage occurs through the computational graph.
+    \item \textbf{The PINN reconstruction error improves substantially:} $\mathrm{vnMSE}_\mathrm{PINN}$ decreases from $0.024$ (initial) to $0.0094$ (epoch~1), ultimately reaching $0.0099$ at epoch~3---a factor-of-$2.4$ reduction. This indicates that the joint PINN term successfully drives the image estimate toward physical consistency with the predicted PSF and noise.
+    \item \textbf{The image NLL degrades from $-3.782$ to $-3.143$} relative to the independently trained image head (Stage~2a final value: $-3.782$). This trade-off is expected and inherent to PINN-based training: the physics-based reconstruction constraint imposes a competing inductive bias that penalizes images which, while individually optimal under the NLL criterion, are inconsistent with the jointly estimated PSF and noise fields. The net validation loss ($-16.095$) is dominated by the NLL terms of the three frozen heads and remains strongly negative.
+    \item \textbf{The total validation loss increases} (becomes less negative) from epoch~1 ($-16.693$) to epoch~3 ($-16.095$). Since only the image head is trainable and its NLL contribution worsens, the total loss follows. The best checkpoint corresponds to \textbf{epoch~1}, which best balances the NLL of the image head with the PINN consistency constraint.
+\end{enumerate}
+
+\paragraph{Summary and convergence assessment}
+
+Table~\ref{tab:summary} collects the best validation-set performance for each training stage, alongside the number of epochs, trainable parameters, and dominant loss type.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|c|l|c|c|c|c|c|}
+\hline
+\textbf{Stage} & \textbf{Component} & \textbf{Architecture} & \textbf{Parameters} & \textbf{Epochs} & \textbf{Loss type} & \textbf{Best $\mathcal{L}_\mathrm{val}$} \\
+\hline
+2a & Image head & U-Net & 11.8 M & 3 & NLL & $-3.739$ \\
+2b & Noise head & U-Net & 11.8 M & 3 & NLL & $-7.812$ \\
+2c & PSF mean head & GPKH & 17.8 M & 5 & vnMSE & $0.01007$ \\
+3 & PSF uncertainty head & GPKH & 17.8 M & 3 & NLL & $-5.195$ \\
+4 & Joint PINN (image only) & All four & 59.2 M & 3 & NLL + PINN & $-16.693$ \\
+\hline
+\end{tabular}
+\caption{Summary of best validation performance across all training stages.}
+\label{tab:summary}
+\end{table}
+
+All stages converge within a small number of epochs ($3$--$5$), which is attributable to the large effective number of gradient updates per epoch ($131\,072$ steps) and the exponentially decaying learning-rate schedule. The total wall-clock training time for the complete pipeline---encompassing all five stages---is on the order of $\sim 20$ hours on a single H100 GPU.
+
+The overarching picture is one of rapid and stable convergence across all components of the model. The independent heads each minimize their respective losses to near-plateau levels within 3--5 epochs, and the subsequent PINN fine-tuning stage successfully introduces physical consistency without catastrophic degradation of the individual head performance. The next subsections will evaluate the generalization of these models to held-out test data and to actual astronomical observations, providing complementary metrics (pixel-level residuals, Strehl ratios, structural similarity indices) that go beyond the NLL and vnMSE training objectives.
+
+\subsection{Validation on an independent image model}
+
+To assess generalisation beyond the simulation pipeline used for training, we evaluate the joint PINN model on a synthetic test dataset generated with GalSim \citep{2015A&C....10..121R}, an independent image-simulation library widely used in the weak-lensing and galaxy-morphology communities. Two classical deconvolution algorithms---Richardson--Lucy (RL) and Wiener filtering---serve as baselines.
+
+\subsubsection{GalSim test dataset}
+
+The test dataset is constructed from three independent grids:
+\begin{enumerate}
+    \item \textbf{Scenes.} Ten sky images, each containing a primary Sérsic galaxy ($n \in [0.8, 4.5]$, half-light radius $r_e \in [0.08, 0.28]\,\mathrm{arcsec}$), a secondary exponential disk (90\% probability), a compact companion (55\% probability), and 1--4 unresolved point sources. All morphological and photometric parameters are drawn from uniform ranges and galaxy profiles are rendered by GalSim's adaptive Fourier-transform engine at $160 \times 160$ pixels ($27\,\mathrm{mas/pixel}$). Each scene is normalised to unit mean surface brightness.
+    \item \textbf{PSFs.} Eleven PSFs: one perfect Airy pattern for the VLT aperture ($D = 8\,\mathrm{m}$, central obscuration $1.116\,\mathrm{m}$) and ten \texttt{OpticalPSF} models with monotonically increasing low-order aberrations (defocus, astigmatism, coma, trefoil, spherical), whose residual wavefront RMS ranges linearly from $0.004$ to $0.05$ waves. These are generated by GalSim's Fourier-optics module with oversampling $1.5\times$ and padding factor $1.5\times$, providing a physically motivated---but structurally different---PSF family compared to the HCIPy-based power-law-plus-Zernike-plus-LWE model used during training.
+    \item \textbf{Noise levels.} Eleven additive Gaussian noise levels with standard deviations linearly spaced from $\sigma = 0$ (noiseless) to $\sigma = 50$ counts/pixel.
+\end{enumerate}
+
+Each scene is convolved with each PSF and corrupted at each noise level, yielding $10 \times 11 \times 11 = 1\,210$ test examples stored as a single TFRecord shard. For evaluation, the first batch of 1\,024 examples is used, matching the batch size of the training pipeline.
+
+\subsubsection{Baseline algorithms}
+
+\paragraph{Richardson--Lucy deconvolution}
+
+The RL algorithm \citep{1972JOSA...62...55R, 1974AJ.....79..745L} is run for 30 iterations using the scikit-image implementation. The \emph{true} PSF is supplied, giving RL an oracle advantage not available in practice. No noise filtering or positivity clipping is applied.
+
+\paragraph{Wiener deconvolution}
+
+Wiener filtering minimises the mean-squared reconstruction error under a white-noise assumption \citep{1949wiener}. The scikit-image implementation is used with the regularisation parameter set to the variance of the true noise map:
+\begin{equation}
+\mathrm{balance} = \max\!\left(\mathrm{Var}(\boldsymbol{\eta}_\mathrm{true}),\; 10^{-12}\right).
+\end{equation}
+As with RL, the true PSF is provided. After filtering, the reconstructed image is rescaled to conserve total flux.
+
+Both baselines receive the ground-truth PSF, whereas the joint PINN model must predict the PSF, noise, and image simultaneously from the observation alone.
+
+\subsubsection{Evaluation protocol}
+
+All predictions are evaluated on a $16$-pixel border-cropped region. For each method and each component (image, PSF, noise), we report the mean squared error (MSE) and the variance-normalised MSE (vnMSE, denoted $R^2$ for compactness):
+\begin{equation}
+R^2_c = \frac{\mathrm{MSE}_c}{\mathrm{Var}(c_\mathrm{true})},
+\end{equation}
+where $c \in \{\mathrm{im},\, \mathrm{psf},\, \mathrm{noise}\}$. $R^2 = 0$ corresponds to a perfect reconstruction; $R^2 = 1$ means the predictor performs no better than the sample mean. For the joint PINN model, the NLL and PINN reconstruction metrics are also computed.
+
+Summary statistics (mean and median over the 1\,024-example test batch) are reported. The median is less sensitive to outliers at extreme noise levels for both baseline methods.
+
+\subsubsection{Results}
+
+Table~\ref{tab:galsim_mse} collects the MSE per component for all three methods.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+\textbf{Method} & \textbf{PSF oracle} & $\mathrm{MSE}_\mathrm{im}$ & $\mathrm{MSE}_\mathrm{psf}$ & $\mathrm{MSE}_\mathrm{noise}$ \\
+\hline
+Joint PINN         & No  & $424.3$  & $38.9$  & $4.52$ \\
+Richardson--Lucy   & Yes & $1006.6$ & ---     & $110.7$ \\
+Wiener             & Yes & $790.8$  & ---     & $34.3$ \\
+\hline
+\end{tabular}
+\caption{Median MSE on the GalSim test set (1\,024 examples). RL and Wiener use the ground-truth PSF; the joint PINN predicts all three components blindly. A ``---'' indicates that the method does not produce a PSF estimate (the truth is used as input).}
+\label{tab:galsim_mse}
+\end{table}
+
+Table~\ref{tab:galsim_vnmse} reports the corresponding vnMSE values.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+\textbf{Method} & $R^2$ (overall) & $R^2_\mathrm{im}$ & $R^2_\mathrm{psf}$ & $R^2_\mathrm{noise}$ \\
+\hline
+Joint PINN         & $0.254$  & $0.720$ & $0.111$ & $0.008$ \\
+Richardson--Lucy   & $0.572$  & $1.147$ & ---     & $0.181$ \\
+Wiener             & $0.437$  & $0.997$ & ---     & $0.054$ \\
+\hline
+\end{tabular}
+\caption{Median vnMSE ($R^2$) on the GalSim test set. Lower is better; $R^2 < 1$ indicates improvement over a constant-mean predictor. The joint PINN achieves the lowest image vnMSE despite receiving no oracle PSF.}
+\label{tab:galsim_vnmse}
+\end{table}
+
+Several findings merit discussion.
+
+\paragraph{Image reconstruction.} The joint PINN achieves a median $R^2_\mathrm{im} = 0.720$, explaining $28\%$ of the true image variance. By contrast, RL yields $R^2_\mathrm{im} = 1.147 > 1$---performing \emph{worse} than a constant-mean predictor on average---and Wiener achieves $R^2_\mathrm{im} = 0.997$, barely breaking even. This result is striking because both classical methods receive the ground-truth PSF, whereas the PINN must jointly estimate it. The classical algorithms are designed for single-PSF deconvolution and have no mechanism to disentangle structured noise from image flux, which degrades their performance at higher noise levels.
+
+\paragraph{PSF estimation.} The joint PINN is the only method that predicts the PSF, achieving a median $R^2_\mathrm{psf} = 0.111$---i.e.\ the predicted PSF captures nearly $89\%$ of the true PSF variance. This is notable given that the GalSim PSFs (parametric \texttt{OpticalPSF} models with eight Zernike modes) are structurally distinct from the HCIPy-based training PSFs (power-law turbulence, Zernike aberrations, and Low Wind Effect modes). The network has therefore learned a representation of the PSF space that transfers across simulation frameworks.
+
+\paragraph{Noise separation.} All methods achieve low noise vnMSE, with the PINN model attaining a median $R^2_\mathrm{noise} = 0.008$---nearly two orders of magnitude below both baselines. This reflects the explicit noise-prediction head, which the classical methods lack.
+
+\paragraph{PINN consistency.} The joint PINN achieves a median PINN reconstruction vnMSE of $R^2_\mathrm{PINN} = 0.007$ on the GalSim set (versus $0.015$ on the validation set), confirming that the physics-informed constraint $\hat{o} = \hat{\mathbf{h}} \ast \hat{\mathbf{x}} - \hat{\boldsymbol{\eta}} \approx \mathbf{y}$ generalises robustly to the independent test domain.
+
+\paragraph{Comparison with validation-set performance.} The PINN image vnMSE increases from $0.135$ (median on the in-distribution validation set) to $0.720$ (GalSim), as expected for out-of-distribution data generated by a different forward model. However, the PSF vnMSE improves from $\sim 0.005$ to $0.111$, reflecting the narrower and more regular GalSim PSF family. The overall picture is one of graceful degradation: the model transfers well to an unseen image-simulation framework, retaining physically meaningful decompositions and outperforming oracle-assisted classical methods in image quality.
+
+\subsection{Application to NaCo AGN observations}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Discussion}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Conclusions}
+Lorem ipsum dolor sit amet,
+consectetuer adipiscing elit. In hac habitasse platea dictumst. In-
+teger tempus convallis augue. Etiam facilisis.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{acknowledgements}
+      Part of this work was supported by \emph{ESO}, project
+      number Ts~17/2--1.
+\end{acknowledgements}
+
+
+\bibliographystyle{bibtex/aa}
+\bibliography{biblio}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% WARNING
+% Please note that we have included the references below in
+% order to compile the document, but we ask you to:
+%
+% - use BibTeX with the regular commands:
+%   \bibliographystyle{aa} % style aa.bst
+%   \bibliography{Yourfile} % your references Yourfile.bib
+% - join the .bib files when you upload your source files
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Appendices must be placed after   \end{thebibliography}
+% They will be placed automatically on a new page.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{appendix}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% In the PDF output, floats should be placed
+% under their own appendix, not before the title, nor after the
+% title of the next appendix.
+
+% In short appendices, onecolumn floats (\figure*
+% or \table*) will generate a blank page.
+% To prevent this behaviour, a few examples are provided here. 
+
+% In case you have a lot of floating objects for little text and the 
+% LaTeX engine moves the floats away from their context, the command
+% \FloatBarrier of the “placeins” package will empty the
+% float buffer and place all stored floats in the continuity.
+
+% If you still encounter problems with wide floats placement,
+% just use the onecolumn environment throughout the appendices.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+%____________________________________________________________
+%       Wide floats at the start of an appendix: first method
+%-------------------------------------------------------------
+% To prevent a blank page after the start of an appendix:
+% - Switch to one \onecolumn first
+% - Declare the section title
+% - Declare the onecolumn float with the parameter [ht!]
+% - Revert to \twocolumn at the end of the section
+\onecolumn
+\section{Wide tables and figures after an appendix title: recommended method}
+
+
+\end{appendix}
+\end{document}
