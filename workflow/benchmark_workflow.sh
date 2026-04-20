@@ -164,9 +164,10 @@ BATCH_SIZES=(1 2 4 8 16 32 64 128 256 512)
 # ---------------------------------------------------------------------------
 INDEPENDENT_HEADS=("im" "psf" "noise")
 
-# Track all submitted job IDs for the final collect step
+# Track submitted architecture-job IDs for the final collect step
 ALL_JOB_IDS=()
 JOB_COUNT=0
+BENCHMARK_CASE_COUNT=0
 
 # ===========================================================================
 # Architecture definitions
@@ -404,15 +405,10 @@ export OMP_NUM_THREADS=$ACPUS"
 	fi
 
 	echo "--- Architecture: $ADESC ---"
+	JOB_TAG="bench_${ATAG}_all_batches"
+	JOB_SCRIPT="$LOG_DIR/${JOB_TAG}.sh"
 
-	for BS in "${BATCH_SIZES[@]}"; do
-		# ---- Independent heads ----
-		for HEAD in "${INDEPENDENT_HEADS[@]}"; do
-			JOB_TAG="bench_${ATAG}_indep_${HEAD}_bs${BS}"
-			JOB_SCRIPT="$LOG_DIR/${JOB_TAG}.sh"
-			RESULT_FILE="$RESULTS_DIR/${JOB_TAG}.json"
-
-			cat > "$JOB_SCRIPT" <<SLURM_EOF
+	cat > "$JOB_SCRIPT" <<SLURM_EOF
 #!/usr/bin/env bash
 #SBATCH --job-name=$JOB_TAG
 #SBATCH --output=$LOG_DIR/${JOB_TAG}_%j.out
@@ -434,70 +430,47 @@ export PYTHONPATH="$ROOT_DIR":"\${PYTHONPATH:-}"
 cd "$ROOT_DIR"
 $TF_THREADING
 
-python3 -u workflow/benchmark_timing.py \\
-	--config "$CONFIG" \\
-	--mode independent \\
-	--head-target $HEAD \\
-	--batch-size $BS \\
-	--n-warmup $N_WARMUP \\
-	--n-repeats $N_REPEATS \\
-	--device $ADEVICE \\
-	--n-gpus $ANGPUS \\
-	> "$RESULT_FILE"
-SLURM_EOF
-			chmod +x "$JOB_SCRIPT"
-			JOB_ID=$(submit_job "$JOB_SCRIPT")
-			ALL_JOB_IDS+=("$JOB_ID")
-			JOB_COUNT=$((JOB_COUNT + 1))
-		done
+BATCH_SIZES=(${BATCH_SIZES[*]})
+INDEPENDENT_HEADS=(${INDEPENDENT_HEADS[*]})
 
-		# ---- Joint model ----
-		JOB_TAG="bench_${ATAG}_joint_bs${BS}"
-		JOB_SCRIPT="$LOG_DIR/${JOB_TAG}.sh"
-		RESULT_FILE="$RESULTS_DIR/${JOB_TAG}.json"
+for BS in "\${BATCH_SIZES[@]}"; do
+	for HEAD in "\${INDEPENDENT_HEADS[@]}"; do
+		RESULT_FILE="$RESULTS_DIR/bench_${ATAG}_indep_\${HEAD}_bs\${BS}.json"
+		python3 -u workflow/benchmark_timing.py \\
+			--config "$CONFIG" \\
+			--mode independent \\
+			--head-target "\${HEAD}" \\
+			--batch-size "\${BS}" \\
+			--n-warmup $N_WARMUP \\
+			--n-repeats $N_REPEATS \\
+			--device $ADEVICE \\
+			--n-gpus $ANGPUS \\
+			> "\${RESULT_FILE}"
+	done
 
-		cat > "$JOB_SCRIPT" <<SLURM_EOF
-#!/usr/bin/env bash
-#SBATCH --job-name=$JOB_TAG
-#SBATCH --output=$LOG_DIR/${JOB_TAG}_%j.out
-#SBATCH --error=$LOG_DIR/${JOB_TAG}_%j.err
-#SBATCH --account=$AACCOUNT
-#SBATCH --qos=$AQOS
-$PARTITION_OPT
-$GRES_OPT
-#SBATCH --cpus-per-task=$ACPUS
-#SBATCH --time=$ATIME
-#SBATCH --hint=nomultithread
-$CONSTRAINT_OPT
-$EXCLUDE_OPT
-
-module purge
-$PREMODULE_CMD
-module load $AMODULE
-export PYTHONPATH="$ROOT_DIR":"\${PYTHONPATH:-}"
-cd "$ROOT_DIR"
-$TF_THREADING
-
-python3 -u workflow/benchmark_timing.py \\
-	--config "$CONFIG" \\
-	--mode joint \\
-	--batch-size $BS \\
-	--n-warmup $N_WARMUP \\
-	--n-repeats $N_REPEATS \\
-	--device $ADEVICE \\
-	--n-gpus $ANGPUS \\
-	> "$RESULT_FILE"
+	RESULT_FILE="$RESULTS_DIR/bench_${ATAG}_joint_bs\${BS}.json"
+	python3 -u workflow/benchmark_timing.py \\
+		--config "$CONFIG" \\
+		--mode joint \\
+		--batch-size "\${BS}" \\
+		--n-warmup $N_WARMUP \\
+		--n-repeats $N_REPEATS \\
+		--device $ADEVICE \\
+		--n-gpus $ANGPUS \\
+		> "\${RESULT_FILE}"
+done
 SLURM_EOF
 		chmod +x "$JOB_SCRIPT"
 		JOB_ID=$(submit_job "$JOB_SCRIPT")
 		ALL_JOB_IDS+=("$JOB_ID")
 		JOB_COUNT=$((JOB_COUNT + 1))
-	done
+		BENCHMARK_CASE_COUNT=$((BENCHMARK_CASE_COUNT + ${#BATCH_SIZES[@]} * (${#INDEPENDENT_HEADS[@]} + 1)))
 	echo ""
 done
 
 echo "=========================================="
 echo "Total jobs submitted: $JOB_COUNT"
+echo "Total benchmark runs: $BENCHMARK_CASE_COUNT"
 echo "=========================================="
 
 # ===========================================================================
