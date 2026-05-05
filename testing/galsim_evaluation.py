@@ -1783,6 +1783,9 @@ def run_plotting(
 	plot_examples: int,
 	plot_dpi: int,
 ) -> dict[str, Any]:
+	import os
+	from concurrent.futures import ThreadPoolExecutor
+
 	import matplotlib
 
 	matplotlib.use("Agg")
@@ -1794,6 +1797,15 @@ def run_plotting(
 	frame_index = int(dict(getattr(cfg, "RICHARDSON_LUCY_CONFIG", {})).get("frame_index", 0))
 	test_cfg = dict(getattr(cfg, "TEST_ON_GALSIM_CONFIG", {}))
 	crop_border = int(test_cfg.get("eval_crop_border", 16))
+	plot_workers = max(
+		1,
+		int(
+			os.environ.get("SLURM_CPUS_PER_TASK")
+			or test_cfg.get("slurm_cpus_per_task", 1)
+			or os.cpu_count()
+			or 1
+		),
+	)
 	loaded_artifacts: dict[str, dict[str, dict[str, np.ndarray]]] = {}
 	loaded_metrics: dict[str, dict[str, dict[str, np.ndarray]]] = {}
 	backends: dict[str, EvaluationBackend] = {}
@@ -1830,8 +1842,9 @@ def run_plotting(
 			int(joint_artifact["obs"].shape[0]),
 			int(rl_artifact["obs"].shape[0]),
 			int(wiener_artifact["obs"].shape[0]),
-			int(plot_examples),
 		)
+		if dataset_name != "galsim":
+			available_examples = min(available_examples, int(plot_examples))
 		example_counts[dataset_name] = available_examples
 		if available_examples <= 0:
 			continue
@@ -1860,7 +1873,8 @@ def run_plotting(
 			"richardson_lucy": (rl_obs, rl_truth, rl_pred),
 			"wiener": (wiener_obs, wiener_truth, wiener_pred),
 		}
-		for example_index in range(available_examples):
+
+		def _plot_example(example_index: int) -> None:
 			# Ground truth is shared across all algorithms.
 			truth_components = _extract_truth_plot_components(
 				obs=joint_obs[example_index],
@@ -1903,6 +1917,15 @@ def run_plotting(
 					out_path=out_path,
 					dpi=plot_dpi,
 				)
+
+		max_example_workers = min(plot_workers, available_examples)
+		if max_example_workers > 1:
+			with ThreadPoolExecutor(max_workers=max_example_workers, thread_name_prefix=f"plot_{dataset_name}") as executor:
+				for _ in executor.map(_plot_example, range(available_examples)):
+					pass
+		else:
+			for example_index in range(available_examples):
+				_plot_example(example_index)
 
 	histogram_counts: dict[str, int] = {}
 	for algorithm in algorithms:
@@ -2015,6 +2038,7 @@ def run_plotting(
 		"plot_root": str(plot_root),
 		"frame_index": frame_index,
 		"plot_examples": int(plot_examples),
+		"plot_workers": int(plot_workers),
 		"plot_dpi": int(plot_dpi),
 		"example_counts": example_counts,
 		"histogram_counts": histogram_counts,
