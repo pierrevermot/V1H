@@ -1599,6 +1599,7 @@ def _plot_metric_comparison_histogram(
 		"joint_pinn": "tab:green",
 		"richardson_lucy": "tab:red",
 		"wiener": "tab:purple",
+		"original_observation": "tab:gray",
 	}
 	for algorithm_name, values in sorted(finite_series.items()):
 		clipped_values = values[(values >= vmin) & (values <= vmax)]
@@ -1623,6 +1624,22 @@ def _plot_metric_comparison_histogram(
 	out_path.parent.mkdir(parents=True, exist_ok=True)
 	fig.savefig(out_path, dpi=dpi)
 	plt.close(fig)
+
+
+def _compute_observation_image_baseline_metrics(
+	*,
+	obs: np.ndarray,
+	y_true: np.ndarray,
+	frame_index: int,
+) -> dict[str, np.ndarray]:
+	obs_tensor = tf.convert_to_tensor(obs, dtype=tf.float32)
+	y_true_tensor = tf.convert_to_tensor(y_true, dtype=tf.float32)
+	truth_im, _, _, _ = _split_truth(y_true_tensor)
+	obs_image = tf.convert_to_tensor(obs_tensor[..., frame_index : frame_index + 1], dtype=tf.float32)
+	return {
+		"mse_im": _per_example_mse(truth_im, obs_image).numpy().astype(np.float32),
+		"r2_im": _per_example_r2(truth_im, obs_image).numpy().astype(np.float32),
+	}
 
 
 def _plot_metric_histogram(
@@ -1952,16 +1969,27 @@ def run_plotting(
 			histogram_counts[algorithm] += 1
 
 	comparison_histogram_counts: dict[str, int] = {"val": 0, "galsim": 0}
+	comparison_histogram_baseline_counts: dict[str, int] = {"val": 0, "galsim": 0}
 	for dataset_name in ("val", "galsim"):
 		common_metric_names = sorted(
 			set.intersection(*(set(loaded_metrics[alg].get(dataset_name, {})) for alg in algorithms))
 		)
+		baseline_metrics = _compute_observation_image_baseline_metrics(
+			obs=loaded_artifacts["joint_pinn"][dataset_name]["obs"],
+			y_true=loaded_artifacts["joint_pinn"][dataset_name]["y_true"],
+			frame_index=frame_index,
+		)
 		for metric_name in common_metric_names:
 			series = {
 				alg: loaded_metrics[alg][dataset_name][metric_name]
-				for alg in algorithms
+				for alg in ("joint_pinn", "richardson_lucy")
 			}
-			out_path = plot_root / "histograms_compare_algorithms" / dataset_name / f"{_sanitize_filename(metric_name)}.png"
+			out_path = (
+				plot_root
+				/ "histograms_compare_algorithms"
+				/ dataset_name
+				/ f"{_sanitize_filename(metric_name)}_no_wiener.png"
+			)
 			_plot_metric_comparison_histogram(
 				dataset_name=dataset_name,
 				metric_name=metric_name,
@@ -1970,6 +1998,23 @@ def run_plotting(
 				dpi=plot_dpi,
 			)
 			comparison_histogram_counts[dataset_name] += 1
+			if metric_name in baseline_metrics:
+				baseline_series = dict(series)
+				baseline_series["original_observation"] = baseline_metrics[metric_name]
+				baseline_out_path = (
+					plot_root
+					/ "histograms_compare_algorithms"
+					/ dataset_name
+					/ f"{_sanitize_filename(metric_name)}_obs_baseline.png"
+				)
+				_plot_metric_comparison_histogram(
+					dataset_name=dataset_name,
+					metric_name=metric_name,
+					series=baseline_series,
+					out_path=baseline_out_path,
+					dpi=plot_dpi,
+				)
+				comparison_histogram_baseline_counts[dataset_name] += 1
 
 	parameter_bar_counts: dict[str, int] = {algorithm: 0 for algorithm in algorithms}
 	comparison_parameter_bar_counts = 0
@@ -2043,6 +2088,7 @@ def run_plotting(
 		"example_counts": example_counts,
 		"histogram_counts": histogram_counts,
 		"comparison_histogram_counts": comparison_histogram_counts,
+		"comparison_histogram_baseline_counts": comparison_histogram_baseline_counts,
 		"parameter_bar_counts": parameter_bar_counts,
 		"comparison_parameter_bar_counts": comparison_parameter_bar_counts,
 	}
