@@ -1399,6 +1399,82 @@ def _extract_prediction_plot_components(
 	raise TypeError(f"Unsupported plotting backend type: {type(backend).__name__}")
 
 
+def _extract_sigma_plot_components(
+	*,
+	backend: EvaluationBackend,
+	y_true: np.ndarray,
+	y_pred: np.ndarray,
+	frame_index: int,
+) -> dict[str, np.ndarray | None]:
+	"""Extract per-component sigma (std-dev) arrays from a saved y_pred for a single example.
+
+	Returns all-None for backends that do not produce uncertainty estimates
+	(richardson_lucy, wiener).  For JointPinnBackend the sigmas are returned
+	in the same normalisation space as the corresponding predictions so they
+	can be passed directly to _plot_truth_vs_prediction:
+	  - sigma["im"]    – image uncertainty in model output space
+	  - sigma["psf"]   – PSF uncertainty in normalised space (same as pred_psf)
+	  - sigma["noise"] – noise uncertainty in normalised space (same as pred_noise)
+	  - sigma["obs"]   – observation uncertainty propagated to physical space
+	"""
+	if not isinstance(backend, JointPinnBackend):
+		return {"obs": None, "im": None, "psf": None, "noise": None}
+	y_true_tensor = tf.convert_to_tensor(y_true[None, ...], dtype=tf.float32)
+	y_pred_tensor = tf.convert_to_tensor(y_pred[None, ...], dtype=tf.float32)
+	_, _, _, n_frames = _split_truth(y_true_tensor)
+	n_frames = int(n_frames)
+	main_channels = 1 + 2 * n_frames
+	pred_main = y_pred_tensor[..., :main_channels]
+	pred_unc = y_pred_tensor[..., main_channels:]
+	pred_im, pred_psf, pred_noise = _split_pred(pred_main, n_frames)
+	unc_im, unc_psf, unc_noise = _split_pred(pred_unc, n_frames)
+	sigma2_im, _ = _pred_to_sigma2(
+		unc_im,
+		log_sigma=backend.model.log_sigma,
+		log_min=backend.model.log_min,
+		log_max=backend.model.log_max,
+		sigma2_eps=backend.model.sigma2_eps,
+	)
+	sigma2_psf, _ = _pred_to_sigma2(
+		unc_psf,
+		log_sigma=backend.model.log_sigma,
+		log_min=backend.model.log_min,
+		log_max=backend.model.log_max,
+		sigma2_eps=backend.model.sigma2_eps,
+	)
+	sigma2_noise, _ = _pred_to_sigma2(
+		unc_noise,
+		log_sigma=backend.model.log_sigma,
+		log_min=backend.model.log_min,
+		log_max=backend.model.log_max,
+		sigma2_eps=backend.model.sigma2_eps,
+	)
+	# Propagate sigma to physical observation space for sigma_obs.
+	psf_df = tf.cast(backend.model._psf_denorm_factor, pred_psf.dtype)
+	noise_df = tf.cast(backend.model._noise_denorm_factor, pred_noise.dtype)
+	pred_psf_phys = pred_psf / psf_df
+	sigma2_psf_phys = sigma2_psf / tf.square(psf_df)
+	pred_psf_phys, sigma2_psf_phys, _ = _normalize_psf_for_observation(
+		pred_psf_phys, sigma2_psf=sigma2_psf_phys
+	)
+	sigma2_noise_phys = sigma2_noise / tf.square(noise_df)
+	sigma2_obs = _propagate_reconstructed_observation_sigma2(
+		pred_im=pred_im,
+		pred_psf_phys=pred_psf_phys,
+		sigma2_im=sigma2_im,
+		sigma2_psf_phys=sigma2_psf_phys,
+		sigma2_noise_phys=sigma2_noise_phys,
+		eps=backend.model.sigma2_eps,
+	)
+	# psf/noise sigmas stay in normalised space to match the space of pred_psf/pred_noise.
+	return {
+		"obs": _select_channel(np.asarray(tf.sqrt(sigma2_obs)[0], dtype=np.float32), frame_index),
+		"im": np.asarray(tf.sqrt(sigma2_im)[0, ..., 0], dtype=np.float32),
+		"psf": _select_channel(np.asarray(tf.sqrt(sigma2_psf)[0], dtype=np.float32), frame_index),
+		"noise": _select_channel(np.asarray(tf.sqrt(sigma2_noise)[0], dtype=np.float32), frame_index),
+	}
+
+
 def _plot_algorithm_comparison_example(
 	*,
 	dataset_name: str,
@@ -1707,6 +1783,11 @@ def run_plotting(
 	plot_examples: int,
 	plot_dpi: int,
 ) -> dict[str, Any]:
+	import matplotlib
+
+	matplotlib.use("Agg")
+	from utils.plot_helpers import _plot_truth_vs_prediction
+
 	algorithms = ("joint_pinn", "richardson_lucy", "wiener")
 	plot_root = output_dir / "plots"
 	galsim_root = Path(str(cfg.GALSIM_TEST_CONFIG["output_dir"])).expanduser().resolve()
@@ -1774,42 +1855,54 @@ def run_plotting(
 			wiener_obs = wiener_obs[:, c:-c, c:-c, :]
 			wiener_truth = wiener_truth[:, c:-c, c:-c, :]
 			wiener_pred = wiener_pred[:, c:-c, c:-c, :]
+		algorithm_obs_truth_pred = {
+			"joint_pinn": (joint_obs, joint_truth, joint_pred),
+			"richardson_lucy": (rl_obs, rl_truth, rl_pred),
+			"wiener": (wiener_obs, wiener_truth, wiener_pred),
+		}
 		for example_index in range(available_examples):
+			# Ground truth is shared across all algorithms.
 			truth_components = _extract_truth_plot_components(
 				obs=joint_obs[example_index],
 				y_true=joint_truth[example_index],
 				frame_index=frame_index,
 			)
-			joint_components = _extract_prediction_plot_components(
-				backend=backends["joint_pinn"],
-				y_true=joint_truth[example_index],
-				y_pred=joint_pred[example_index],
-				frame_index=frame_index,
-			)
-			rl_components = _extract_prediction_plot_components(
-				backend=backends["richardson_lucy"],
-				y_true=rl_truth[example_index],
-				y_pred=rl_pred[example_index],
-				frame_index=frame_index,
-			)
-			wiener_components = _extract_prediction_plot_components(
-				backend=backends["wiener"],
-				y_true=wiener_truth[example_index],
-				y_pred=wiener_pred[example_index],
-				frame_index=frame_index,
-			)
-			out_path = plot_root / "examples" / dataset_name / f"example_{example_index:04d}.png"
-			_plot_algorithm_comparison_example(
-				dataset_name=dataset_name,
-				example_index=example_index,
-				frame_index=frame_index,
-				truth=truth_components,
-				joint=joint_components,
-				rl=rl_components,
-				wiener=wiener_components,
-				out_path=out_path,
-				dpi=plot_dpi,
-			)
+			for algorithm in algorithms:
+				alg_obs, alg_truth, alg_pred = algorithm_obs_truth_pred[algorithm]
+				pred_components = _extract_prediction_plot_components(
+					backend=backends[algorithm],
+					y_true=alg_truth[example_index],
+					y_pred=alg_pred[example_index],
+					frame_index=frame_index,
+				)
+				sigma_components = _extract_sigma_plot_components(
+					backend=backends[algorithm],
+					y_true=alg_truth[example_index],
+					y_pred=alg_pred[example_index],
+					frame_index=frame_index,
+				)
+				out_path = (
+					plot_root / "examples" / dataset_name / algorithm / "predictions"
+					/ f"example_{example_index:04d}.png"
+				)
+				_plot_truth_vs_prediction(
+					obs_true=truth_components["obs"],
+					im_true=truth_components["im"],
+					psf_true=truth_components["psf"],
+					noise_true=truth_components["noise"],
+					obs_pred=pred_components["obs"],
+					im_pred=pred_components["im"],
+					psf_pred=pred_components["psf"],
+					noise_pred=pred_components["noise"],
+					sigma_obs=sigma_components["obs"],
+					sigma_im=sigma_components["im"],
+					sigma_psf=sigma_components["psf"],
+					sigma_noise=sigma_components["noise"],
+					frame=frame_index,
+					obs_panel_n_pix_zero=0,
+					out_path=out_path,
+					dpi=plot_dpi,
+				)
 
 	histogram_counts: dict[str, int] = {}
 	for algorithm in algorithms:
