@@ -240,6 +240,7 @@ def _plot_truth_vs_prediction(
 		_imshow(axes[2, 3], noise_true - noise_pred, "Res residual", norm=noise_res_norm, cmap="coolwarm")
 		for col in range(4):
 			fig.colorbar(axes[2, col].images[0], ax=axes[2, col], fraction=0.046, pad=0.04)
+	out_path.parent.mkdir(parents=True, exist_ok=True)
 	fig.savefig(out_path, dpi=dpi)
 	plt.close(fig)
 
@@ -285,6 +286,7 @@ def _plot_truth_vs_recovered(
 	_imshow(axes[2, 3], noise_true - noise_rec, "Res residual", norm=noise_res_norm, cmap="coolwarm")
 	for col in range(4):
 		fig.colorbar(axes[2, col].images[0], ax=axes[2, col], fraction=0.046, pad=0.04)
+	out_path.parent.mkdir(parents=True, exist_ok=True)
 	fig.savefig(out_path, dpi=dpi)
 	plt.close(fig)
 
@@ -368,5 +370,6 @@ def _plot_inference_example(
 	for col in range(3):
 		fig.colorbar(axes[3, col].images[0], ax=axes[3, col], fraction=0.046, pad=0.04)
 	fig.tight_layout()
+	out_path.parent.mkdir(parents=True, exist_ok=True)
 	fig.savefig(out_path, dpi=dpi)
 	plt.close(fig)
