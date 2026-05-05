@@ -24,10 +24,16 @@ def _parse_args() -> argparse.Namespace:
 	parser.add_argument("--output-dir", type=Path, default=None)
 	parser.add_argument("--plot-examples", type=int, default=None, help="Number of examples per dataset to plot")
 	parser.add_argument("--plot-dpi", type=int, default=None, help="Output DPI for saved figures")
-	parser.add_argument(
+	mode_group = parser.add_mutually_exclusive_group()
+	mode_group.add_argument(
 		"--histograms-only",
 		action="store_true",
 		help="Only generate histogram figures and skip example/parameter plots",
+	)
+	mode_group.add_argument(
+		"--parameter-bars-only",
+		action="store_true",
+		help="Only generate parameter-bar figures and skip example/histogram plots",
 	)
 	return parser.parse_args()
 
@@ -51,6 +57,7 @@ def main() -> None:
 		plot_examples=settings["plot_examples"],
 		plot_dpi=settings["plot_dpi"],
 		histograms_only=args.histograms_only,
+		parameter_bars_only=args.parameter_bars_only,
 	)
 
 

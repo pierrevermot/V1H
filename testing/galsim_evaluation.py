@@ -1761,6 +1761,7 @@ def _plot_parameter_median_bars(
 		"joint_pinn": "tab:green",
 		"richardson_lucy": "tab:red",
 		"wiener": "tab:purple",
+		"original_observation": "tab:gray",
 	}
 	for label_index, label in enumerate(labels):
 		values = np.asarray(series[label], dtype=np.float32).reshape(-1)
@@ -1800,6 +1801,7 @@ def run_plotting(
 	plot_examples: int,
 	plot_dpi: int,
 	histograms_only: bool = False,
+	parameter_bars_only: bool = False,
 ) -> dict[str, Any]:
 	import os
 	from concurrent.futures import ThreadPoolExecutor
@@ -1828,6 +1830,9 @@ def run_plotting(
 	loaded_metrics: dict[str, dict[str, dict[str, np.ndarray]]] = {}
 	backends: dict[str, EvaluationBackend] = {}
 	generation_log = _load_generation_parameter_log(galsim_root)
+	plot_examples_enabled = not histograms_only and not parameter_bars_only
+	plot_histograms_enabled = not parameter_bars_only
+	plot_parameter_bars_enabled = not histograms_only
 	for algorithm in algorithms:
 		result_dir = _resolve_result_dir(output_dir, algorithm)
 		manifest_path = result_dir / "inference_manifest.json"
@@ -1852,7 +1857,7 @@ def run_plotting(
 		}
 
 	example_counts: dict[str, int] = {"val": 0, "galsim": 0}
-	if not histograms_only:
+	if plot_examples_enabled:
 		for dataset_name in ("val", "galsim"):
 			joint_artifact = loaded_artifacts["joint_pinn"][dataset_name]
 			rl_artifact = loaded_artifacts["richardson_lucy"][dataset_name]
@@ -1946,81 +1951,82 @@ def run_plotting(
 				for example_index in range(available_examples):
 					_plot_example(example_index)
 
-	histogram_counts: dict[str, int] = {}
-	for algorithm in algorithms:
-		metric_names = sorted(
-			set(loaded_metrics[algorithm].get("val", {})) | set(loaded_metrics[algorithm].get("galsim", {}))
-		)
-		histogram_counts[algorithm] = 0
-		for metric_name in metric_names:
-			series = {
-				dataset_name: metrics[metric_name]
-				for dataset_name, metrics in loaded_metrics[algorithm].items()
-				if metric_name in metrics
-			}
-			if not series:
-				continue
-			out_path = plot_root / "histograms" / algorithm / f"{_sanitize_filename(metric_name)}.png"
-			_plot_metric_histogram(
-				algorithm=algorithm,
-				metric_name=metric_name,
-				series=series,
-				out_path=out_path,
-				dpi=plot_dpi,
-			)
-			histogram_counts[algorithm] += 1
-
+	histogram_counts: dict[str, int] = {algorithm: 0 for algorithm in algorithms}
 	comparison_histogram_counts: dict[str, int] = {"val": 0, "galsim": 0}
 	comparison_histogram_baseline_counts: dict[str, int] = {"val": 0, "galsim": 0}
-	for dataset_name in ("val", "galsim"):
-		common_metric_names = sorted(
-			set.intersection(*(set(loaded_metrics[alg].get(dataset_name, {})) for alg in algorithms))
-		)
-		baseline_metrics = _compute_observation_image_baseline_metrics(
-			obs=loaded_artifacts["joint_pinn"][dataset_name]["obs"],
-			y_true=loaded_artifacts["joint_pinn"][dataset_name]["y_true"],
-			frame_index=frame_index,
-		)
-		for metric_name in common_metric_names:
-			series = {
-				alg: loaded_metrics[alg][dataset_name][metric_name]
-				for alg in ("joint_pinn", "richardson_lucy")
-			}
-			out_path = (
-				plot_root
-				/ "histograms_compare_algorithms"
-				/ dataset_name
-				/ f"{_sanitize_filename(metric_name)}_no_wiener.png"
+	if plot_histograms_enabled:
+		for algorithm in algorithms:
+			metric_names = sorted(
+				set(loaded_metrics[algorithm].get("val", {})) | set(loaded_metrics[algorithm].get("galsim", {}))
 			)
-			_plot_metric_comparison_histogram(
-				dataset_name=dataset_name,
-				metric_name=metric_name,
-				series=series,
-				out_path=out_path,
-				dpi=plot_dpi,
+			for metric_name in metric_names:
+				series = {
+					dataset_name: metrics[metric_name]
+					for dataset_name, metrics in loaded_metrics[algorithm].items()
+					if metric_name in metrics
+				}
+				if not series:
+					continue
+				out_path = plot_root / "histograms" / algorithm / f"{_sanitize_filename(metric_name)}.png"
+				_plot_metric_histogram(
+					algorithm=algorithm,
+					metric_name=metric_name,
+					series=series,
+					out_path=out_path,
+					dpi=plot_dpi,
+				)
+				histogram_counts[algorithm] += 1
+
+		for dataset_name in ("val", "galsim"):
+			common_metric_names = sorted(
+				set.intersection(*(set(loaded_metrics[alg].get(dataset_name, {})) for alg in algorithms))
 			)
-			comparison_histogram_counts[dataset_name] += 1
-			if metric_name in baseline_metrics:
-				baseline_series = dict(series)
-				baseline_series["original_observation"] = baseline_metrics[metric_name]
-				baseline_out_path = (
+			baseline_metrics = _compute_observation_image_baseline_metrics(
+				obs=loaded_artifacts["joint_pinn"][dataset_name]["obs"],
+				y_true=loaded_artifacts["joint_pinn"][dataset_name]["y_true"],
+				frame_index=frame_index,
+			)
+			for metric_name in common_metric_names:
+				series = {
+					alg: loaded_metrics[alg][dataset_name][metric_name]
+					for alg in ("joint_pinn", "richardson_lucy")
+				}
+				out_path = (
 					plot_root
 					/ "histograms_compare_algorithms"
 					/ dataset_name
-					/ f"{_sanitize_filename(metric_name)}_obs_baseline.png"
+					/ f"{_sanitize_filename(metric_name)}_no_wiener.png"
 				)
 				_plot_metric_comparison_histogram(
 					dataset_name=dataset_name,
 					metric_name=metric_name,
-					series=baseline_series,
-					out_path=baseline_out_path,
+					series=series,
+					out_path=out_path,
 					dpi=plot_dpi,
 				)
-				comparison_histogram_baseline_counts[dataset_name] += 1
+				comparison_histogram_counts[dataset_name] += 1
+				if metric_name in baseline_metrics:
+					baseline_series = dict(series)
+					baseline_series["original_observation"] = baseline_metrics[metric_name]
+					baseline_out_path = (
+						plot_root
+						/ "histograms_compare_algorithms"
+						/ dataset_name
+						/ f"{_sanitize_filename(metric_name)}_obs_baseline.png"
+					)
+					_plot_metric_comparison_histogram(
+						dataset_name=dataset_name,
+						metric_name=metric_name,
+						series=baseline_series,
+						out_path=baseline_out_path,
+						dpi=plot_dpi,
+					)
+					comparison_histogram_baseline_counts[dataset_name] += 1
 
 	parameter_bar_counts: dict[str, int] = {algorithm: 0 for algorithm in algorithms}
 	comparison_parameter_bar_counts = 0
-	if not histograms_only:
+	comparison_parameter_bar_baseline_counts = 0
+	if plot_parameter_bars_enabled:
 		galsim_entries = list(generation_log.get("per_example", []))
 		parameter_names = ("noise_sigma", "psf_residual_wavefront_rms_waves")
 		for algorithm in algorithms:
@@ -2053,6 +2059,11 @@ def run_plotting(
 			set.intersection(*(set(loaded_metrics[alg].get("galsim", {})) for alg in algorithms))
 		)
 		if common_galsim_metrics and galsim_entries:
+			baseline_metrics = _compute_observation_image_baseline_metrics(
+				obs=loaded_artifacts["joint_pinn"]["galsim"]["obs"],
+				y_true=loaded_artifacts["joint_pinn"]["galsim"]["y_true"],
+				frame_index=frame_index,
+			)
 			n_examples_common = min(
 				len(galsim_entries),
 				*(min(len(loaded_metrics[alg]["galsim"][name]) for name in common_galsim_metrics) for alg in algorithms),
@@ -2067,7 +2078,7 @@ def run_plotting(
 						plot_root
 						/ "parameter_bars_compare_algorithms"
 						/ parameter_name
-						/ f"{_sanitize_filename(metric_name)}.png"
+						/ f"{_sanitize_filename(metric_name)}_no_wiener.png"
 					)
 					_plot_parameter_median_bars(
 						parameter_name=parameter_name,
@@ -2075,17 +2086,38 @@ def run_plotting(
 						parameter_values=parameter_values,
 						series={
 							alg: loaded_metrics[alg]["galsim"][metric_name][:n_examples_common]
-							for alg in algorithms
+							for alg in ("joint_pinn", "richardson_lucy")
 						},
 						out_path=out_path,
 						dpi=plot_dpi,
 					)
 					comparison_parameter_bar_counts += 1
+					if metric_name in baseline_metrics:
+						baseline_out_path = (
+							plot_root
+							/ "parameter_bars_compare_algorithms"
+							/ parameter_name
+							/ f"{_sanitize_filename(metric_name)}_obs_baseline.png"
+						)
+						_plot_parameter_median_bars(
+							parameter_name=parameter_name,
+							metric_name=metric_name,
+							parameter_values=parameter_values,
+							series={
+								"joint_pinn": loaded_metrics["joint_pinn"]["galsim"][metric_name][:n_examples_common],
+								"richardson_lucy": loaded_metrics["richardson_lucy"]["galsim"][metric_name][:n_examples_common],
+								"original_observation": baseline_metrics[metric_name][:n_examples_common],
+							},
+							out_path=baseline_out_path,
+							dpi=plot_dpi,
+						)
+						comparison_parameter_bar_baseline_counts += 1
 
 	report = {
 		"plot_root": str(plot_root),
 		"frame_index": frame_index,
 		"histograms_only": bool(histograms_only),
+		"parameter_bars_only": bool(parameter_bars_only),
 		"plot_examples": int(plot_examples),
 		"plot_workers": int(plot_workers),
 		"plot_dpi": int(plot_dpi),
@@ -2095,6 +2127,7 @@ def run_plotting(
 		"comparison_histogram_baseline_counts": comparison_histogram_baseline_counts,
 		"parameter_bar_counts": parameter_bar_counts,
 		"comparison_parameter_bar_counts": comparison_parameter_bar_counts,
+		"comparison_parameter_bar_baseline_counts": comparison_parameter_bar_baseline_counts,
 	}
 	plot_root.mkdir(parents=True, exist_ok=True)
 	with (plot_root / "plot_report.json").open("w", encoding="utf-8") as handle:
