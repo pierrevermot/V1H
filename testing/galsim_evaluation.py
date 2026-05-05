@@ -30,6 +30,7 @@ from utils.model_io import (
 	_resolve_model_paths,
 )
 from utils.normalization import _compute_norm_factor, _normalize_psf_for_observation
+from utils.plot_helpers import _save_figure_png_and_pdf
 from workflow.joint_pinn_fourhead_training import FourHeadJointPinnModel
 
 
@@ -1559,8 +1560,7 @@ def _plot_algorithm_comparison_example(
 				ax.set_ylabel(row_label, fontsize=11)
 	fig.suptitle(f"{dataset_name} example {example_index} (frame {frame_index})", fontsize=14)
 	fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.98))
-	out_path.parent.mkdir(parents=True, exist_ok=True)
-	fig.savefig(out_path, dpi=dpi)
+	_save_figure_png_and_pdf(fig, out_path, dpi=dpi)
 	plt.close(fig)
 
 
@@ -1621,8 +1621,7 @@ def _plot_metric_comparison_histogram(
 	ax.grid(True, alpha=0.25)
 	ax.legend()
 	fig.tight_layout()
-	out_path.parent.mkdir(parents=True, exist_ok=True)
-	fig.savefig(out_path, dpi=dpi)
+	_save_figure_png_and_pdf(fig, out_path, dpi=dpi)
 	plt.close(fig)
 
 
@@ -1697,8 +1696,7 @@ def _plot_metric_histogram(
 	ax.grid(True, alpha=0.25)
 	ax.legend()
 	fig.tight_layout()
-	out_path.parent.mkdir(parents=True, exist_ok=True)
-	fig.savefig(out_path, dpi=dpi)
+	_save_figure_png_and_pdf(fig, out_path, dpi=dpi)
 	plt.close(fig)
 
 
@@ -1787,8 +1785,7 @@ def _plot_parameter_median_bars(
 	ax.grid(True, axis="y", alpha=0.25)
 	ax.legend()
 	fig.tight_layout()
-	out_path.parent.mkdir(parents=True, exist_ok=True)
-	fig.savefig(out_path, dpi=dpi)
+	_save_figure_png_and_pdf(fig, out_path, dpi=dpi)
 	plt.close(fig)
 
 

@@ -36,6 +36,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from configs.load_config import load_experiment_config
+from utils.plot_helpers import _save_figure_png_and_pdf
 
 # -----------------------------
 # Global simulation parameters
@@ -778,7 +779,12 @@ def save_example_plots(
             fontsize=11,
         )
         figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.92))
-        figure.savefig(plots_dir / f"example_{plot_index:03d}.png", dpi=150, bbox_inches="tight")
+        _save_figure_png_and_pdf(
+            figure,
+            plots_dir / f"example_{plot_index:03d}.png",
+            dpi=150,
+            bbox_inches="tight",
+        )
         plt.close(figure)
 
     return {
