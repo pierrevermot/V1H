@@ -1799,6 +1799,7 @@ def run_plotting(
 	output_dir: Path,
 	plot_examples: int,
 	plot_dpi: int,
+	histograms_only: bool = False,
 ) -> dict[str, Any]:
 	import os
 	from concurrent.futures import ThreadPoolExecutor
@@ -1850,99 +1851,100 @@ def run_plotting(
 			dataset_name: _load_saved_metrics(result_dir, dataset_name) for dataset_name in manifest["datasets"]
 		}
 
-	example_counts: dict[str, int] = {}
-	for dataset_name in ("val", "galsim"):
-		joint_artifact = loaded_artifacts["joint_pinn"][dataset_name]
-		rl_artifact = loaded_artifacts["richardson_lucy"][dataset_name]
-		wiener_artifact = loaded_artifacts["wiener"][dataset_name]
-		available_examples = min(
-			int(joint_artifact["obs"].shape[0]),
-			int(rl_artifact["obs"].shape[0]),
-			int(wiener_artifact["obs"].shape[0]),
-		)
-		if dataset_name != "galsim":
-			available_examples = min(available_examples, int(plot_examples))
-		example_counts[dataset_name] = available_examples
-		if available_examples <= 0:
-			continue
-		joint_obs = joint_artifact["obs"][:available_examples]
-		joint_truth = joint_artifact["y_true"][:available_examples]
-		joint_pred = joint_artifact["y_pred"][:available_examples]
-		rl_obs = rl_artifact["obs"][:available_examples]
-		rl_truth = rl_artifact["y_true"][:available_examples]
-		rl_pred = rl_artifact["y_pred"][:available_examples]
-		wiener_obs = wiener_artifact["obs"][:available_examples]
-		wiener_truth = wiener_artifact["y_true"][:available_examples]
-		wiener_pred = wiener_artifact["y_pred"][:available_examples]
-		if crop_border > 0:
-			c = crop_border
-			joint_obs = joint_obs[:, c:-c, c:-c, :]
-			joint_truth = joint_truth[:, c:-c, c:-c, :]
-			joint_pred = joint_pred[:, c:-c, c:-c, :]
-			rl_obs = rl_obs[:, c:-c, c:-c, :]
-			rl_truth = rl_truth[:, c:-c, c:-c, :]
-			rl_pred = rl_pred[:, c:-c, c:-c, :]
-			wiener_obs = wiener_obs[:, c:-c, c:-c, :]
-			wiener_truth = wiener_truth[:, c:-c, c:-c, :]
-			wiener_pred = wiener_pred[:, c:-c, c:-c, :]
-		algorithm_obs_truth_pred = {
-			"joint_pinn": (joint_obs, joint_truth, joint_pred),
-			"richardson_lucy": (rl_obs, rl_truth, rl_pred),
-			"wiener": (wiener_obs, wiener_truth, wiener_pred),
-		}
-
-		def _plot_example(example_index: int) -> None:
-			# Ground truth is shared across all algorithms.
-			truth_components = _extract_truth_plot_components(
-				obs=joint_obs[example_index],
-				y_true=joint_truth[example_index],
-				frame_index=frame_index,
+	example_counts: dict[str, int] = {"val": 0, "galsim": 0}
+	if not histograms_only:
+		for dataset_name in ("val", "galsim"):
+			joint_artifact = loaded_artifacts["joint_pinn"][dataset_name]
+			rl_artifact = loaded_artifacts["richardson_lucy"][dataset_name]
+			wiener_artifact = loaded_artifacts["wiener"][dataset_name]
+			available_examples = min(
+				int(joint_artifact["obs"].shape[0]),
+				int(rl_artifact["obs"].shape[0]),
+				int(wiener_artifact["obs"].shape[0]),
 			)
-			for algorithm in algorithms:
-				alg_obs, alg_truth, alg_pred = algorithm_obs_truth_pred[algorithm]
-				pred_components = _extract_prediction_plot_components(
-					backend=backends[algorithm],
-					y_true=alg_truth[example_index],
-					y_pred=alg_pred[example_index],
-					frame_index=frame_index,
-				)
-				sigma_components = _extract_sigma_plot_components(
-					backend=backends[algorithm],
-					y_true=alg_truth[example_index],
-					y_pred=alg_pred[example_index],
-					frame_index=frame_index,
-				)
-				out_path = (
-					plot_root / "examples" / dataset_name / algorithm / "predictions"
-					/ f"example_{example_index:04d}.png"
-				)
-				_plot_truth_vs_prediction(
-					obs_true=truth_components["obs"],
-					im_true=truth_components["im"],
-					psf_true=truth_components["psf"],
-					noise_true=truth_components["noise"],
-					obs_pred=pred_components["obs"],
-					im_pred=pred_components["im"],
-					psf_pred=pred_components["psf"],
-					noise_pred=pred_components["noise"],
-					sigma_obs=sigma_components["obs"],
-					sigma_im=sigma_components["im"],
-					sigma_psf=sigma_components["psf"],
-					sigma_noise=sigma_components["noise"],
-					frame=frame_index,
-					obs_panel_n_pix_zero=0,
-					out_path=out_path,
-					dpi=plot_dpi,
-				)
+			if dataset_name != "galsim":
+				available_examples = min(available_examples, int(plot_examples))
+			example_counts[dataset_name] = available_examples
+			if available_examples <= 0:
+				continue
+			joint_obs = joint_artifact["obs"][:available_examples]
+			joint_truth = joint_artifact["y_true"][:available_examples]
+			joint_pred = joint_artifact["y_pred"][:available_examples]
+			rl_obs = rl_artifact["obs"][:available_examples]
+			rl_truth = rl_artifact["y_true"][:available_examples]
+			rl_pred = rl_artifact["y_pred"][:available_examples]
+			wiener_obs = wiener_artifact["obs"][:available_examples]
+			wiener_truth = wiener_artifact["y_true"][:available_examples]
+			wiener_pred = wiener_artifact["y_pred"][:available_examples]
+			if crop_border > 0:
+				c = crop_border
+				joint_obs = joint_obs[:, c:-c, c:-c, :]
+				joint_truth = joint_truth[:, c:-c, c:-c, :]
+				joint_pred = joint_pred[:, c:-c, c:-c, :]
+				rl_obs = rl_obs[:, c:-c, c:-c, :]
+				rl_truth = rl_truth[:, c:-c, c:-c, :]
+				rl_pred = rl_pred[:, c:-c, c:-c, :]
+				wiener_obs = wiener_obs[:, c:-c, c:-c, :]
+				wiener_truth = wiener_truth[:, c:-c, c:-c, :]
+				wiener_pred = wiener_pred[:, c:-c, c:-c, :]
+			algorithm_obs_truth_pred = {
+				"joint_pinn": (joint_obs, joint_truth, joint_pred),
+				"richardson_lucy": (rl_obs, rl_truth, rl_pred),
+				"wiener": (wiener_obs, wiener_truth, wiener_pred),
+			}
 
-		max_example_workers = min(plot_workers, available_examples)
-		if max_example_workers > 1:
-			with ThreadPoolExecutor(max_workers=max_example_workers, thread_name_prefix=f"plot_{dataset_name}") as executor:
-				for _ in executor.map(_plot_example, range(available_examples)):
-					pass
-		else:
-			for example_index in range(available_examples):
-				_plot_example(example_index)
+			def _plot_example(example_index: int) -> None:
+				# Ground truth is shared across all algorithms.
+				truth_components = _extract_truth_plot_components(
+					obs=joint_obs[example_index],
+					y_true=joint_truth[example_index],
+					frame_index=frame_index,
+				)
+				for algorithm in algorithms:
+					alg_obs, alg_truth, alg_pred = algorithm_obs_truth_pred[algorithm]
+					pred_components = _extract_prediction_plot_components(
+						backend=backends[algorithm],
+						y_true=alg_truth[example_index],
+						y_pred=alg_pred[example_index],
+						frame_index=frame_index,
+					)
+					sigma_components = _extract_sigma_plot_components(
+						backend=backends[algorithm],
+						y_true=alg_truth[example_index],
+						y_pred=alg_pred[example_index],
+						frame_index=frame_index,
+					)
+					out_path = (
+						plot_root / "examples" / dataset_name / algorithm / "predictions"
+						/ f"example_{example_index:04d}.png"
+					)
+					_plot_truth_vs_prediction(
+						obs_true=truth_components["obs"],
+						im_true=truth_components["im"],
+						psf_true=truth_components["psf"],
+						noise_true=truth_components["noise"],
+						obs_pred=pred_components["obs"],
+						im_pred=pred_components["im"],
+						psf_pred=pred_components["psf"],
+						noise_pred=pred_components["noise"],
+						sigma_obs=sigma_components["obs"],
+						sigma_im=sigma_components["im"],
+						sigma_psf=sigma_components["psf"],
+						sigma_noise=sigma_components["noise"],
+						frame=frame_index,
+						obs_panel_n_pix_zero=0,
+						out_path=out_path,
+						dpi=plot_dpi,
+					)
+
+			max_example_workers = min(plot_workers, available_examples)
+			if max_example_workers > 1:
+				with ThreadPoolExecutor(max_workers=max_example_workers, thread_name_prefix=f"plot_{dataset_name}") as executor:
+					for _ in executor.map(_plot_example, range(available_examples)):
+						pass
+			else:
+				for example_index in range(available_examples):
+					_plot_example(example_index)
 
 	histogram_counts: dict[str, int] = {}
 	for algorithm in algorithms:
@@ -2018,70 +2020,72 @@ def run_plotting(
 
 	parameter_bar_counts: dict[str, int] = {algorithm: 0 for algorithm in algorithms}
 	comparison_parameter_bar_counts = 0
-	galsim_entries = list(generation_log.get("per_example", []))
-	parameter_names = ("noise_sigma", "psf_residual_wavefront_rms_waves")
-	for algorithm in algorithms:
-		galsim_metrics = loaded_metrics[algorithm].get("galsim", {})
-		if not galsim_metrics:
-			continue
-		n_examples = min(len(galsim_entries), min(len(values) for values in galsim_metrics.values()))
-		if n_examples <= 0:
-			continue
-		parameter_arrays = {
-			name: np.asarray([entry.get(name, np.nan) for entry in galsim_entries[:n_examples]], dtype=np.float32)
-			for name in parameter_names
-		}
-		for parameter_name, parameter_values in parameter_arrays.items():
-			for metric_name, metric_values in galsim_metrics.items():
-				out_path = (
-					plot_root / "parameter_bars" / algorithm / parameter_name / f"{_sanitize_filename(metric_name)}.png"
-				)
-				_plot_parameter_median_bars(
-					parameter_name=parameter_name,
-					metric_name=metric_name,
-					parameter_values=parameter_values,
-					series={algorithm: metric_values[:n_examples]},
-					out_path=out_path,
-					dpi=plot_dpi,
-				)
-				parameter_bar_counts[algorithm] += 1
+	if not histograms_only:
+		galsim_entries = list(generation_log.get("per_example", []))
+		parameter_names = ("noise_sigma", "psf_residual_wavefront_rms_waves")
+		for algorithm in algorithms:
+			galsim_metrics = loaded_metrics[algorithm].get("galsim", {})
+			if not galsim_metrics:
+				continue
+			n_examples = min(len(galsim_entries), min(len(values) for values in galsim_metrics.values()))
+			if n_examples <= 0:
+				continue
+			parameter_arrays = {
+				name: np.asarray([entry.get(name, np.nan) for entry in galsim_entries[:n_examples]], dtype=np.float32)
+				for name in parameter_names
+			}
+			for parameter_name, parameter_values in parameter_arrays.items():
+				for metric_name, metric_values in galsim_metrics.items():
+					out_path = (
+						plot_root / "parameter_bars" / algorithm / parameter_name / f"{_sanitize_filename(metric_name)}.png"
+					)
+					_plot_parameter_median_bars(
+						parameter_name=parameter_name,
+						metric_name=metric_name,
+						parameter_values=parameter_values,
+						series={algorithm: metric_values[:n_examples]},
+						out_path=out_path,
+						dpi=plot_dpi,
+					)
+					parameter_bar_counts[algorithm] += 1
 
-	common_galsim_metrics = sorted(
-		set.intersection(*(set(loaded_metrics[alg].get("galsim", {})) for alg in algorithms))
-	)
-	if common_galsim_metrics and galsim_entries:
-		n_examples_common = min(
-			len(galsim_entries),
-			*(min(len(loaded_metrics[alg]["galsim"][name]) for name in common_galsim_metrics) for alg in algorithms),
+		common_galsim_metrics = sorted(
+			set.intersection(*(set(loaded_metrics[alg].get("galsim", {})) for alg in algorithms))
 		)
-		parameter_arrays_common = {
-			name: np.asarray([entry.get(name, np.nan) for entry in galsim_entries[:n_examples_common]], dtype=np.float32)
-			for name in parameter_names
-		}
-		for parameter_name, parameter_values in parameter_arrays_common.items():
-			for metric_name in common_galsim_metrics:
-				out_path = (
-					plot_root
-					/ "parameter_bars_compare_algorithms"
-					/ parameter_name
-					/ f"{_sanitize_filename(metric_name)}.png"
-				)
-				_plot_parameter_median_bars(
-					parameter_name=parameter_name,
-					metric_name=metric_name,
-					parameter_values=parameter_values,
-					series={
-						alg: loaded_metrics[alg]["galsim"][metric_name][:n_examples_common]
-						for alg in algorithms
-					},
-					out_path=out_path,
-					dpi=plot_dpi,
-				)
-				comparison_parameter_bar_counts += 1
+		if common_galsim_metrics and galsim_entries:
+			n_examples_common = min(
+				len(galsim_entries),
+				*(min(len(loaded_metrics[alg]["galsim"][name]) for name in common_galsim_metrics) for alg in algorithms),
+			)
+			parameter_arrays_common = {
+				name: np.asarray([entry.get(name, np.nan) for entry in galsim_entries[:n_examples_common]], dtype=np.float32)
+				for name in parameter_names
+			}
+			for parameter_name, parameter_values in parameter_arrays_common.items():
+				for metric_name in common_galsim_metrics:
+					out_path = (
+						plot_root
+						/ "parameter_bars_compare_algorithms"
+						/ parameter_name
+						/ f"{_sanitize_filename(metric_name)}.png"
+					)
+					_plot_parameter_median_bars(
+						parameter_name=parameter_name,
+						metric_name=metric_name,
+						parameter_values=parameter_values,
+						series={
+							alg: loaded_metrics[alg]["galsim"][metric_name][:n_examples_common]
+							for alg in algorithms
+						},
+						out_path=out_path,
+						dpi=plot_dpi,
+					)
+					comparison_parameter_bar_counts += 1
 
 	report = {
 		"plot_root": str(plot_root),
 		"frame_index": frame_index,
+		"histograms_only": bool(histograms_only),
 		"plot_examples": int(plot_examples),
 		"plot_workers": int(plot_workers),
 		"plot_dpi": int(plot_dpi),
