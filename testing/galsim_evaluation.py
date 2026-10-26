@@ -21,6 +21,7 @@ from configs.load_config import load_experiment_config
 from neural_networks.dataset import make_dataset
 from neural_networks.losses import _convolve_image_with_psfs
 from utils.io import _load_joint_run_config
+from utils.evaluation_metrics import interval_coverage, object_image_metrics
 from utils.metrics import _pred_to_sigma2, _split_pred, _split_truth
 from utils.model_io import (
 	_load_independent_head_model,
@@ -31,6 +32,7 @@ from utils.model_io import (
 )
 from utils.normalization import _compute_norm_factor, _normalize_psf_for_observation
 from utils.plot_helpers import _save_figure_png_and_pdf
+from utils.uncertainty import propagate_observation_variance
 from workflow.joint_pinn_fourhead_training import FourHeadJointPinnModel
 
 
@@ -74,6 +76,8 @@ class EvaluationBackend:
 		obs: tf.Tensor,
 		y_true: tf.Tensor,
 		y_pred: tf.Tensor,
+		*,
+		crop_border: int | None = None,
 	) -> dict[str, np.ndarray]:
 		raise NotImplementedError
 
@@ -85,7 +89,7 @@ class EvaluationBackend:
 		return {"backend": self.backend_name}
 
 
-def _build_joint_training_cfg_from_experiment_config(cfg, *, run_dir: Path, model_label: str) -> dict[str, Any]:
+def _build_joint_training_cfg_from_experiment_config(cfg, *, run_dir: Path, model_label: str, require_joint_checkpoint: bool = True) -> dict[str, Any]:
 	output_base_dir = Path(cfg.OUTPUT_BASE_DIR).expanduser().resolve()
 	joint_config = dict(cfg.JOINT_PINN_CONFIG)
 	loss_config = dict(cfg.LOSS_CONFIG)
@@ -100,7 +104,10 @@ def _build_joint_training_cfg_from_experiment_config(cfg, *, run_dir: Path, mode
 	noise_model_path = _resolve_model_paths(noise_run_dir)[model_label]
 	psf_mean_model_path = _resolve_model_paths(psf_mean_run_dir)[model_label]
 	psf_unc_model_path = _resolve_model_paths(psf_unc_run_dir)[model_label]
-	joint_model_path = _resolve_joint_model_paths(run_dir, {})[model_label]
+	joint_model_path = (
+		_resolve_joint_model_paths(run_dir, {})[model_label]
+		if require_joint_checkpoint else image_model_path
+	)
 
 	return {
 		"run": str(joint_config.get("run_name", run_dir.name)),
@@ -178,6 +185,22 @@ def _per_example_weighted_residual(truth: tf.Tensor, pred: tf.Tensor, sigma2: tf
 	return _per_example_mean(err2 / sigma2)
 
 
+def _crop_metric_tensor(tensor: tf.Tensor, border: int) -> tf.Tensor:
+	"""Crop a metric field once, after all full-field forward calculations."""
+	border = int(border)
+	if border < 0 or 2 * border >= min(int(tensor.shape[1]), int(tensor.shape[2])):
+		raise ValueError("Metric crop must leave a nonempty image")
+	return tensor[:, border:-border, border:-border, :] if border else tensor
+
+
+def _numpy_metrics(values: dict[str, Any]) -> dict[str, np.ndarray]:
+	return {key: np.asarray(value, dtype=np.float32) for key, value in values.items()}
+
+
+def _coverage_metrics(truth, mean, variance, suffix: str) -> dict[str, np.ndarray]:
+	return {f"{key}_{suffix}": value for key, value in interval_coverage(truth, mean, variance).items()}
+
+
 def _propagate_reconstructed_observation_sigma2(
 	*,
 	pred_im: tf.Tensor,
@@ -187,11 +210,11 @@ def _propagate_reconstructed_observation_sigma2(
 	sigma2_noise_phys: tf.Tensor,
 	eps: float,
 ) -> tf.Tensor:
-	term_im = _convolve_image_with_psfs(sigma2_im, tf.square(pred_psf_phys))
-	term_psf = _convolve_image_with_psfs(tf.square(pred_im), sigma2_psf_phys)
-	term_cross = _convolve_image_with_psfs(sigma2_im, sigma2_psf_phys)
-	sigma2_obs = term_im + term_psf + term_cross + sigma2_noise_phys
-	return tf.maximum(sigma2_obs, tf.cast(eps, sigma2_obs.dtype))
+	return propagate_observation_variance(
+		pred_im=pred_im, pred_psf_phys=pred_psf_phys,
+		sigma2_im=sigma2_im, sigma2_psf_phys=sigma2_psf_phys,
+		sigma2_noise_phys=sigma2_noise_phys, eps=eps,
+	)
 
 
 def _concat_components(*arrays: tf.Tensor) -> tf.Tensor:
@@ -320,6 +343,8 @@ def _render_comparison_table(
 
 @register_backend("joint_pinn")
 class JointPinnBackend(EvaluationBackend):
+	load_joint_checkpoint = True
+
 	def __init__(
 		self,
 		*,
@@ -354,8 +379,8 @@ class JointPinnBackend(EvaluationBackend):
 				cfg,
 				run_dir=run_dir,
 				model_label=model_label,
+				require_joint_checkpoint=cls.load_joint_checkpoint,
 			)
-		joint_model_path = _resolve_joint_model_paths(run_dir, training_cfg)[model_label]
 
 		source_models = dict(training_cfg.get("source_models", {}))
 		image_cfg = dict(source_models.get("image", {}))
@@ -364,6 +389,10 @@ class JointPinnBackend(EvaluationBackend):
 		psf_unc_cfg = dict(source_models.get("psf_unc", {}))
 
 		image_model_path = Path(str(image_cfg.get("model_path", ""))).expanduser().resolve()
+		joint_model_path = (
+			_resolve_joint_model_paths(run_dir, training_cfg)[model_label]
+			if cls.load_joint_checkpoint else image_model_path
+		)
 		noise_model_path = Path(str(noise_cfg.get("model_path", ""))).expanduser().resolve()
 		psf_mean_model_path = Path(str(psf_mean_cfg.get("model_path", ""))).expanduser().resolve()
 		psf_unc_model_path = Path(str(psf_unc_cfg.get("model_path", ""))).expanduser().resolve()
@@ -420,7 +449,8 @@ class JointPinnBackend(EvaluationBackend):
 			name="joint_pinn_fourhead_model",
 		)
 		_ = model(tf.convert_to_tensor(preview_obs, dtype=tf.float32), training=False)
-		model = _load_weights_into_rebuilt_model(model, joint_model_path)
+		if cls.load_joint_checkpoint:
+			model = _load_weights_into_rebuilt_model(model, joint_model_path)
 		return cls(model=model, run_dir=run_dir, model_path=joint_model_path, training_cfg=training_cfg)
 
 	def describe(self) -> dict[str, Any]:
@@ -428,6 +458,7 @@ class JointPinnBackend(EvaluationBackend):
 			"backend": self.backend_name,
 			"run_dir": str(self.run_dir),
 			"model_path": str(self.model_path),
+			"joint_checkpoint_loaded": self.load_joint_checkpoint,
 		}
 
 	def predict_batch(self, obs: tf.Tensor, y_true: tf.Tensor | None = None) -> tf.Tensor:
@@ -440,6 +471,8 @@ class JointPinnBackend(EvaluationBackend):
 		pred_im: tf.Tensor,
 		pred_psf: tf.Tensor,
 		pred_noise: tf.Tensor,
+		*,
+		crop_border: int | None = None,
 	) -> tf.Tensor:
 		psf_df = tf.cast(self.model._psf_denorm_factor, pred_psf.dtype)
 		noise_df = tf.cast(self.model._noise_denorm_factor, pred_noise.dtype)
@@ -447,10 +480,8 @@ class JointPinnBackend(EvaluationBackend):
 		pred_psf_phys, _, _ = _normalize_psf_for_observation(pred_psf_phys)
 		pred_noise_phys = pred_noise / noise_df
 		pred_obs = _convolve_image_with_psfs(pred_im, pred_psf_phys) - pred_noise_phys
-		if self.model.reconstruction_crop > 0:
-			c = int(self.model.reconstruction_crop)
-			pred_obs = pred_obs[:, c:-c, c:-c, :]
-			obs = obs[:, c:-c, c:-c, :]
+		c = int(self.model.reconstruction_crop if crop_border is None else crop_border)
+		pred_obs, obs = (_crop_metric_tensor(x, c) for x in (pred_obs, obs))
 		return _per_example_mean(tf.square(pred_obs - obs)) / _per_example_variance(obs)
 
 	def _predicted_observation_and_sigma2(
@@ -489,6 +520,8 @@ class JointPinnBackend(EvaluationBackend):
 		obs: tf.Tensor,
 		y_true: tf.Tensor,
 		y_pred: tf.Tensor,
+		*,
+		crop_border: int | None = None,
 	) -> dict[str, np.ndarray]:
 		obs = tf.convert_to_tensor(obs, dtype=tf.float32)
 		y_true = tf.convert_to_tensor(y_true, dtype=tf.float32)
@@ -523,6 +556,19 @@ class JointPinnBackend(EvaluationBackend):
 			sigma2_eps=self.model.sigma2_eps,
 		)
 
+		# Convolution and PSF normalization must see the full model output.
+		# Only the resulting fields are cropped for metric evaluation.
+		pred_obs, sigma2_obs = self._predicted_observation_and_sigma2(
+			pred_im, pred_psf, pred_noise, sigma2_im, sigma2_psf, sigma2_noise,
+		)
+		c = int(self.model.reconstruction_crop if crop_border is None else crop_border)
+		truth_im, truth_psf, truth_noise, pred_im, pred_psf, pred_noise, sigma2_im, sigma2_psf, sigma2_noise, obs_for_pinn, pred_obs, sigma2_obs = (
+			_crop_metric_tensor(tensor, c) for tensor in (
+				truth_im, truth_psf, truth_noise, pred_im, pred_psf, pred_noise,
+				sigma2_im, sigma2_psf, sigma2_noise, obs, pred_obs, sigma2_obs,
+			)
+		)
+
 		nll_im, nll_im_residual, nll_im_logsigma2 = _per_example_nll(truth_im, pred_im, sigma2_im)
 		nll_psf, nll_psf_residual, nll_psf_logsigma2 = _per_example_nll(truth_psf, pred_psf, sigma2_psf)
 		nll_noise, nll_noise_residual, nll_noise_logsigma2 = _per_example_nll(truth_noise, pred_noise, sigma2_noise)
@@ -541,21 +587,7 @@ class JointPinnBackend(EvaluationBackend):
 		mse = _per_example_mse(truth_all, pred_all)
 		r2 = _per_example_r2(truth_all, pred_all)
 		nll, _, _ = _per_example_nll(truth_all, pred_all, sigma2_all)
-		r2_pinn = self._per_example_pinn_r2(obs, pred_im, pred_psf, pred_noise)
-		pred_obs, sigma2_obs = self._predicted_observation_and_sigma2(
-			pred_im,
-			pred_psf,
-			pred_noise,
-			sigma2_im,
-			sigma2_psf,
-			sigma2_noise,
-		)
-		obs_for_pinn = obs
-		if self.model.reconstruction_crop > 0:
-			c = int(self.model.reconstruction_crop)
-			pred_obs = pred_obs[:, c:-c, c:-c, :]
-			sigma2_obs = sigma2_obs[:, c:-c, c:-c, :]
-			obs_for_pinn = obs_for_pinn[:, c:-c, c:-c, :]
+		r2_pinn = _per_example_r2(obs_for_pinn, pred_obs)
 		pinn_loss_step4 = tf.cast(self.pinn_weight, r2_pinn.dtype) * r2_pinn
 		pinn_loss_unc = _per_example_weighted_residual(obs_for_pinn, pred_obs, sigma2_obs)
 		loss_supervised = self.im_weight * nll_im + self.psf_weight * nll_psf + self.noise_weight * nll_noise
@@ -586,7 +618,21 @@ class JointPinnBackend(EvaluationBackend):
 			"nll_noise_logsigma2": nll_noise_logsigma2,
 			"r2_pinn": r2_pinn,
 		}
-		return {key: value.numpy().astype(np.float32) for key, value in result.items()}
+		result.update(object_image_metrics(truth_im, pred_im))
+		for suffix, truth, mean, variance in (
+			("im", truth_im, pred_im, sigma2_im),
+			("psf", truth_psf, pred_psf, sigma2_psf),
+			("noise", truth_noise, pred_noise, sigma2_noise),
+			("obs", obs_for_pinn, pred_obs, sigma2_obs),
+		):
+			result.update(_coverage_metrics(truth, mean, variance, suffix))
+		return _numpy_metrics(result)
+
+
+@register_backend("pretrained")
+class PretrainedBackend(JointPinnBackend):
+	"""The same frozen components with the independently pretrained object head."""
+	load_joint_checkpoint = False
 
 
 @register_backend("richardson_lucy")
@@ -605,6 +651,8 @@ class RichardsonLucyBackend(EvaluationBackend):
 		noise_norm_factor: float,
 	):
 		self.num_iter = int(num_iter)
+		if self.num_iter < 1:
+			raise ValueError("Richardson-Lucy requires at least one iteration")
 		self.psf_source = str(psf_source)
 		self.frame_index = int(frame_index)
 		self.clip = bool(clip)
@@ -656,6 +704,10 @@ class RichardsonLucyBackend(EvaluationBackend):
 			"frame_index": self.frame_index,
 			"clip": self.clip,
 			"filter_epsilon": self.filter_epsilon,
+			"negative_input_policy": "clip_zero",
+			"input_scaling": "stored observation scale; no per-prediction rescaling",
+			"psf_normalization": "negative numerical samples clipped to zero, then unit-sum physical kernel",
+			"psf_denorm_factor": self.psf_denorm_factor,
 		}
 
 	def _select_truth_frame(self, tensor: tf.Tensor) -> tf.Tensor:
@@ -683,10 +735,11 @@ class RichardsonLucyBackend(EvaluationBackend):
 		obs_np = np.asarray(obs_frame[..., 0], dtype=np.float32)
 		psf_np = np.asarray(psf_model[..., 0], dtype=np.float32)
 		pred_images: list[np.ndarray] = []
+		solver_psfs: list[np.ndarray] = []
 		for example_index in range(obs_np.shape[0]):
 			obs_example = np.asarray(obs_np[example_index], dtype=np.float32)
 			psf_example = np.asarray(psf_np[example_index], dtype=np.float32)
-			psf_phys = psf_example / float(self.psf_denorm_factor)
+			psf_phys = np.maximum(psf_example / float(self.psf_denorm_factor), 0.0)
 			psf_phys, _, _ = _normalize_psf_for_observation(
 				tf.convert_to_tensor(psf_phys[None, ..., None], dtype=tf.float32)
 			)
@@ -700,9 +753,10 @@ class RichardsonLucyBackend(EvaluationBackend):
 				filter_epsilon=self.filter_epsilon,
 			)
 			pred_images.append(np.asarray(pred_image, dtype=np.float32))
+			solver_psfs.append(psf_kernel)
 
 		pred_im = np.stack(pred_images, axis=0)[..., None]
-		pred_psf = np.asarray(psf_model, dtype=np.float32)
+		pred_psf = np.stack(solver_psfs, axis=0)[..., None] * float(self.psf_denorm_factor)
 		pred_psf_phys = tf.convert_to_tensor(pred_psf / float(self.psf_denorm_factor), dtype=tf.float32)
 		pred_psf_phys, _, _ = _normalize_psf_for_observation(pred_psf_phys)
 		pred_obs = _convolve_image_with_psfs(tf.convert_to_tensor(pred_im, dtype=tf.float32), pred_psf_phys)
@@ -722,10 +776,13 @@ class RichardsonLucyBackend(EvaluationBackend):
 		obs: tf.Tensor,
 		y_true: tf.Tensor,
 		y_pred: tf.Tensor,
+		*,
+		crop_border: int | None = None,
 	) -> dict[str, np.ndarray]:
-		_ = obs
-		y_true = tf.convert_to_tensor(y_true, dtype=tf.float32)
-		y_pred = tf.convert_to_tensor(y_pred, dtype=tf.float32)
+		c = int(crop_border or 0)
+		obs = _crop_metric_tensor(tf.convert_to_tensor(obs, dtype=tf.float32), c)
+		y_true = _crop_metric_tensor(tf.convert_to_tensor(y_true, dtype=tf.float32), c)
+		y_pred = _crop_metric_tensor(tf.convert_to_tensor(y_pred, dtype=tf.float32), c)
 		truth_im, truth_psf_all, truth_noise_all, _ = _split_truth(y_true)
 		truth_psf = self._select_truth_frame(truth_psf_all)
 		truth_noise = self._select_truth_frame(truth_noise_all)
@@ -744,7 +801,9 @@ class RichardsonLucyBackend(EvaluationBackend):
 			"r2_psf": _per_example_r2(truth_psf, pred_psf),
 			"r2_noise": _per_example_r2(truth_noise, pred_noise),
 		}
-		return {key: value.numpy().astype(np.float32) for key, value in result.items()}
+		result.update(object_image_metrics(truth_im, pred_im))
+		result["negative_input_fraction"] = _per_example_mean(tf.cast(obs < 0, tf.float32))
+		return _numpy_metrics(result)
 
 
 @register_backend("wiener")
@@ -802,6 +861,12 @@ class WienerBackend(EvaluationBackend):
 			"backend": self.backend_name,
 			"psf_source": self.psf_source,
 			"frame_index": self.frame_index,
+			"negative_input_policy": "clip_zero",
+			"output_negative_policy": "clip_zero",
+			"noise_variance_source": "ground_truth_noise_map",
+			"output_scaling": "match signed observation total flux",
+			"psf_normalization": "unit-sum physical kernel; signed numerical samples retained",
+			"psf_denorm_factor": self.psf_denorm_factor,
 		}
 
 	def _select_truth_frame(self, tensor: tf.Tensor) -> tf.Tensor:
@@ -879,10 +944,13 @@ class WienerBackend(EvaluationBackend):
 		obs: tf.Tensor,
 		y_true: tf.Tensor,
 		y_pred: tf.Tensor,
+		*,
+		crop_border: int | None = None,
 	) -> dict[str, np.ndarray]:
-		_ = obs
-		y_true = tf.convert_to_tensor(y_true, dtype=tf.float32)
-		y_pred = tf.convert_to_tensor(y_pred, dtype=tf.float32)
+		c = int(crop_border or 0)
+		obs = _crop_metric_tensor(tf.convert_to_tensor(obs, dtype=tf.float32), c)
+		y_true = _crop_metric_tensor(tf.convert_to_tensor(y_true, dtype=tf.float32), c)
+		y_pred = _crop_metric_tensor(tf.convert_to_tensor(y_pred, dtype=tf.float32), c)
 		truth_im, truth_psf_all, truth_noise_all, _ = _split_truth(y_true)
 		truth_psf = self._select_truth_frame(truth_psf_all)
 		truth_noise = self._select_truth_frame(truth_noise_all)
@@ -901,7 +969,9 @@ class WienerBackend(EvaluationBackend):
 			"r2_psf": _per_example_r2(truth_psf, pred_psf),
 			"r2_noise": _per_example_r2(truth_noise, pred_noise),
 		}
-		return {key: value.numpy().astype(np.float32) for key, value in result.items()}
+		result.update(object_image_metrics(truth_im, pred_im))
+		result["negative_input_fraction"] = _per_example_mean(tf.cast(obs < 0, tf.float32))
+		return _numpy_metrics(result)
 
 
 def _build_dataset_specs(cfg) -> list[DatasetSpec]:
@@ -929,6 +999,7 @@ def _make_eval_dataset(cfg, data_dir: Path, batch_size: int) -> tf.data.Dataset:
 		norm_psf=dataset_cfg.get("norm_psf"),
 		norm_noise=dataset_cfg.get("norm_noise"),
 		num_parallel_calls=dataset_cfg.get("num_parallel_calls"),
+		num_parallel_reads=1,
 		prefetch=bool(dataset_cfg.get("prefetch", True)),
 	)
 
@@ -1109,14 +1180,11 @@ def _evaluate_saved_inference(
 		obs_batch = obs[start:stop]
 		y_true_batch = y_true[start:stop]
 		y_pred_batch = y_pred[start:stop]
-		if c > 0:
-			obs_batch = obs_batch[:, c:-c, c:-c, :]
-			y_true_batch = y_true_batch[:, c:-c, c:-c, :]
-			y_pred_batch = y_pred_batch[:, c:-c, c:-c, :]
 		batch_metrics = backend.evaluate_prediction_batch(
 			obs_batch,
 			y_true_batch,
 			y_pred_batch,
+			crop_border=c,
 		)
 		for name, values in batch_metrics.items():
 			metric_history.setdefault(name, []).append(np.asarray(values, dtype=np.float32).reshape(-1))
@@ -1172,6 +1240,7 @@ def run_inference(
 			"artifact_path": artifact_name,
 			"batches_evaluated": int(n_batches_used),
 			"n_examples": int(artifact["obs"].shape[0]),
+			"negative_input_pixel_fraction": float(np.mean(artifact["obs"] < 0)),
 		}
 		print(
 			f"[test_on_galsim step2a] Saved {spec.name} inference to {result_dir / artifact_name} "
@@ -1262,6 +1331,16 @@ def run_analysis(
 		"eval_batch_size": int(manifest.get("eval_batch_size", analysis_batch_size)),
 		"analysis_batch_size": int(analysis_batch_size),
 		"first_batch_only": bool(manifest.get("first_batch_only", False)),
+		"metric_policy": {
+			"crop_border": crop_border,
+			"forward_reconstruction": "full model field, then one metric crop",
+			"aggregation": "one metric per image; summaries over images",
+			"object_predictions": "raw, including negative intensities",
+			"psnr_ssim_range": "truth max-min; constant truths use max(abs(truth), 1)",
+			"coverage": "marginal simulation-conditioned predictive intervals",
+			"coverage_gaussian_reference": {"1sigma": 0.682689492, "2sigma": 0.954499736},
+			"observation_variance": "independent component/pixel approximation including product-variance term",
+		},
 		"datasets": manifest["datasets"],
 		"component_summaries": component_summaries,
 		"summaries": all_summaries,
@@ -1937,6 +2016,12 @@ def run_plotting(
 						obs_panel_n_pix_zero=0,
 						out_path=out_path,
 						dpi=plot_dpi,
+						pixel_scale_arcsec=float(cfg.ANGULAR_PIXEL_SCALE) * 206265.0,
+						psf_denorm_factor=(
+							float(backends[algorithm].model._psf_denorm_factor)
+							if isinstance(backends[algorithm], JointPinnBackend)
+							else float(backends[algorithm].psf_denorm_factor)
+						),
 					)
 
 			max_example_workers = min(plot_workers, available_examples)

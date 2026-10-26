@@ -20,6 +20,10 @@ with uncertainty estimates for the recovered quantities.
 
 The full pipeline is orchestrated by `workflow/run_experiment.sh`, which submits the stages as dependent SLURM jobs.
 
+The [referee campaign](docs/referee_campaign.md) adds before/after comparisons,
+PSNR/SSIM, interval coverage, PINN-weight controls, RL iteration sensitivity,
+saved-checkpoint timings, NaCo/reference-star figures and a final STORE archive.
+
 ## Repository Layout
 
 - `configs/`: experiment configuration template and config loader
@@ -102,6 +106,20 @@ Preview the submitted jobs without launching them:
 ```bash
 bash workflow/run_experiment.sh configs/experiment_template.py --gpu h100 --dry-run
 ```
+
+Add a final archive job on Jean Zay:
+
+```bash
+bash workflow/run_experiment.sh configs/experiment_template.py --gpu h100 --archive-store "$STORE"
+```
+
+The archive job uses partition `archive`, waits for all submitted stages to finish,
+and writes `<run-name>.tar` plus a SHA-256 checksum into the requested directory.
+It retains the entire run except its top-level `dataset/` directory and does not
+follow symlinks. Store bulk training caches under `dataset/` as well when they
+should be omitted. Submission IDs are recorded in `jobs.json` and
+`slurm_logs/submissions.jsonl`. Failed dependent stages are cancelled so the
+archive can also preserve partial results and their logs.
 
 Plot results from a run directory:
 

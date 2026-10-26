@@ -899,6 +899,8 @@ def main() -> None:
 	cfg = load_experiment_config(args.config)
 
 	joint_config = dict(cfg.JOINT_PINN_CONFIG)
+	if joint_config.get("seed") is not None:
+		tf.keras.utils.set_random_seed(int(joint_config["seed"]))
 	dataset_config = dict(cfg.DATASET_LOAD_CONFIG)
 	loss_config = dict(cfg.LOSS_CONFIG)
 	output_base_dir = Path(cfg.OUTPUT_BASE_DIR)
@@ -963,6 +965,7 @@ def main() -> None:
 		norm_psf=dataset_config["norm_psf"],
 		norm_noise=dataset_config["norm_noise"],
 		num_parallel_calls=dataset_config["num_parallel_calls"],
+		num_parallel_reads=dataset_config.get("num_parallel_reads"),
 		prefetch=dataset_config["prefetch"],
 	)
 

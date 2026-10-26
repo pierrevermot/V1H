@@ -39,6 +39,7 @@ from utils.io import (
 	_write_fits_image,
 )
 from utils.metrics import _pred_to_sigma2
+from utils.uncertainty import propagate_observation_variance
 from utils.model_io import (
 	_load_independent_head_model,
 	_load_stage2_head_model,
@@ -102,6 +103,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--psf-reconstruction-n-crop-pix", type=int, default=16)
 	parser.add_argument("--obs-panel-n-pix-zero", type=int, default=16)
 	parser.add_argument("--dpi", type=int, default=150)
+	parser.add_argument("--pixel-scale-arcsec", type=float, default=None, help="Angular sampling for plot axes; omitted when unavailable")
 	parser.add_argument("--inference-only", action="store_true")
 	parser.add_argument("--skip-data-inference", action="store_true")
 	return parser.parse_args()
@@ -198,6 +200,12 @@ def _build_joint_model(checkpoint_path: Path, training_cfg: dict[str, Any], prev
 
 
 def _predict_joint_batch(model: FourHeadJointPinnModel, obs_hwf: np.ndarray) -> dict[str, np.ndarray | bool]:
+	"""Predict component means and marginal standard deviations.
+
+	Observation variance uses the same independent-pixel, independent-component
+	approximation as synthetic evaluation, including the product-variance term.
+	It does not include spatial covariance or uncertainty in model parameters.
+	"""
 	obs_tf = tf.convert_to_tensor(obs_hwf.astype(np.float32))
 	n_frames = int(obs_hwf.shape[-1])
 	y_pred = tf.convert_to_tensor(model(obs_tf, training=False))
@@ -221,10 +229,11 @@ def _predict_joint_batch(model: FourHeadJointPinnModel, obs_hwf: np.ndarray) -> 
 	sigma2_noise_phys = sigma2_noise / tf.square(noise_df)
 	pred_psf_recon, sigma2_psf_recon, _ = _normalize_psf_for_observation(pred_psf_phys, sigma2_psf=sigma2_psf_phys)
 	pred_obs = _convolve_image_with_psfs(pred_im, pred_psf_recon) - pred_noise_phys
-	sigma2_obs = _convolve_image_with_psfs(sigma2_im, tf.square(pred_psf_recon))
-	sigma2_obs += _convolve_image_with_psfs(tf.square(pred_im), sigma2_psf_recon)
-	sigma2_obs += sigma2_noise_phys
-	sigma2_obs = tf.maximum(sigma2_obs, tf.cast(1e-12, sigma2_obs.dtype))
+	sigma2_obs = propagate_observation_variance(
+		pred_im=pred_im, pred_psf_phys=pred_psf_recon,
+		sigma2_im=sigma2_im, sigma2_psf_phys=sigma2_psf_recon,
+		sigma2_noise_phys=sigma2_noise_phys, eps=1e-12,
+	)
 	return {
 		"has_uncertainty": True,
 		"pred_im": pred_im.numpy().astype(np.float32),
@@ -233,11 +242,11 @@ def _predict_joint_batch(model: FourHeadJointPinnModel, obs_hwf: np.ndarray) -> 
 		"pred_psf_phys": pred_psf_recon.numpy().astype(np.float32),
 		"pred_noise_phys": pred_noise_phys.numpy().astype(np.float32),
 		"pred_obs": pred_obs.numpy().astype(np.float32),
-		"sigma_im": tf.sqrt(tf.maximum(sigma2_im, 1e-12)).numpy().astype(np.float32),
-		"sigma_psf": tf.sqrt(tf.maximum(sigma2_psf, 1e-12)).numpy().astype(np.float32),
-		"sigma_noise": tf.sqrt(tf.maximum(sigma2_noise, 1e-12)).numpy().astype(np.float32),
-		"sigma_psf_phys": tf.sqrt(tf.maximum(sigma2_psf_recon, 1e-12)).numpy().astype(np.float32),
-		"sigma_noise_phys": tf.sqrt(tf.maximum(sigma2_noise_phys, 1e-12)).numpy().astype(np.float32),
+		"sigma_im": tf.sqrt(tf.maximum(sigma2_im, 0)).numpy().astype(np.float32),
+		"sigma_psf": tf.sqrt(tf.maximum(sigma2_psf, 0)).numpy().astype(np.float32),
+		"sigma_noise": tf.sqrt(tf.maximum(sigma2_noise, 0)).numpy().astype(np.float32),
+		"sigma_psf_phys": tf.sqrt(tf.maximum(sigma2_psf_recon, 0)).numpy().astype(np.float32),
+		"sigma_noise_phys": tf.sqrt(tf.maximum(sigma2_noise_phys, 0)).numpy().astype(np.float32),
 		"sigma_obs": tf.sqrt(sigma2_obs).numpy().astype(np.float32),
 	}
 
@@ -269,6 +278,7 @@ def _run_tfrecord_plots(
 	psf_reconstruction_verbose: bool,
 	obs_panel_n_pix_zero: int,
 	dpi: int,
+	pixel_scale_arcsec: float | None = None,
 ) -> None:
 	_ = run_dir
 	dataset_cfg = dict(training_cfg.get("dataset", {}))
@@ -321,8 +331,8 @@ def _run_tfrecord_plots(
 		sigma_im = np.asarray(pred["sigma_im"])[out_idx, :, :, 0]
 		sigma_psf = np.asarray(pred["sigma_psf_phys"])[out_idx, :, :, frame]
 		sigma_noise = np.asarray(pred["sigma_noise_phys"])[out_idx, :, :, frame]
-		_plot_truth_vs_prediction(obs_true=obs_true, im_true=im_true, psf_true=psf_true, noise_true=noise_true, obs_pred=obs_pred, im_pred=im_pred, psf_pred=psf_pred, noise_pred=noise_pred, sigma_obs=sigma_obs, sigma_im=sigma_im, sigma_psf=sigma_psf, sigma_noise=sigma_noise, frame=frame, obs_panel_n_pix_zero=obs_panel_n_pix_zero, out_path=pred_dir / f"example_{ex_idx:03d}.png", dpi=dpi)
-		_plot_truth_vs_recovered(obs_true=obs_true, im_true=im_true, psf_true=psf_true, noise_true=noise_true, obs_rec=recovered["recovered_obs"][out_idx, :, :, frame], im_rec=recovered["recovered_im"][out_idx, :, :, 0], psf_rec=recovered["recovered_psf"][out_idx, :, :, frame], noise_rec=recovered["recovered_noise"][out_idx, :, :, frame], frame=frame, out_path=rec_dir / f"example_{ex_idx:03d}.png", dpi=dpi)
+		_plot_truth_vs_prediction(obs_true=obs_true, im_true=im_true, psf_true=psf_true, noise_true=noise_true, obs_pred=obs_pred, im_pred=im_pred, psf_pred=psf_pred, noise_pred=noise_pred, sigma_obs=sigma_obs, sigma_im=sigma_im, sigma_psf=sigma_psf, sigma_noise=sigma_noise, frame=frame, obs_panel_n_pix_zero=obs_panel_n_pix_zero, out_path=pred_dir / f"example_{ex_idx:03d}.png", dpi=dpi, pixel_scale_arcsec=pixel_scale_arcsec)
+		_plot_truth_vs_recovered(obs_true=obs_true, im_true=im_true, psf_true=psf_true, noise_true=noise_true, obs_rec=recovered["recovered_obs"][out_idx, :, :, frame], im_rec=recovered["recovered_im"][out_idx, :, :, 0], psf_rec=recovered["recovered_psf"][out_idx, :, :, frame], noise_rec=recovered["recovered_noise"][out_idx, :, :, frame], frame=frame, out_path=rec_dir / f"example_{ex_idx:03d}.png", dpi=dpi, pixel_scale_arcsec=pixel_scale_arcsec)
 
 
 def _run_data_inference_plots(
@@ -348,6 +358,7 @@ def _run_data_inference_plots(
 	psf_reconstruction_tv_weight: float,
 	psf_reconstruction_verbose: bool,
 	dpi: int,
+	pixel_scale_arcsec: float | None = None,
 ) -> None:
 	_ = run_dir
 	cube = np.asarray(np.load(data_path), dtype=np.float32)
@@ -445,7 +456,7 @@ def _run_data_inference_plots(
 			rec_noise_frames[global_frame] = rec_noise_chunk[:, :, local_frame].astype(np.float32)
 
 	def _write_inference_panel_set(panel_dir: Path, *, obs_true: np.ndarray, pred_im: np.ndarray, pred_psf: np.ndarray, pred_noise: np.ndarray, pred_obs: np.ndarray, sigma_obs: np.ndarray | None, sigma_im: np.ndarray | None, sigma_psf: np.ndarray | None, sigma_noise: np.ndarray | None, rec_im: np.ndarray, rec_psf: np.ndarray, rec_noise: np.ndarray, frame_label: str | int, frame_header: int) -> None:
-		_plot_inference_example(obs_true=obs_true, pred_im=pred_im, pred_psf=pred_psf, pred_noise=pred_noise, pred_obs=pred_obs, sigma_obs=sigma_obs, sigma_im=sigma_im, sigma_psf=sigma_psf, sigma_noise=sigma_noise, rec_im=rec_im, rec_psf=rec_psf, rec_noise=rec_noise, frame=frame_label, out_path=infer_dir / f"{panel_dir.name}.png", dpi=dpi)
+		_plot_inference_example(obs_true=obs_true, pred_im=pred_im, pred_psf=pred_psf, pred_noise=pred_noise, pred_obs=pred_obs, sigma_obs=sigma_obs, sigma_im=sigma_im, sigma_psf=sigma_psf, sigma_noise=sigma_noise, rec_im=rec_im, rec_psf=rec_psf, rec_noise=rec_noise, frame=frame_label, out_path=infer_dir / f"{panel_dir.name}.png", dpi=dpi, pixel_scale_arcsec=pixel_scale_arcsec)
 		header = {"MODEL": model_label, "FRAME": int(frame_header), "DATA": str(data_path.name)}
 		_write_fits_image(image_hw=obs_true, path=panel_dir / "true_obs.fits", header={**header, "PANEL": "true_obs"})
 		_write_fits_image(image_hw=pred_im, path=panel_dir / "pred_im.fits", header={**header, "PANEL": "pred_im"})
@@ -506,6 +517,8 @@ def _run_data_inference_plots(
 
 def main() -> None:
 	args = parse_args()
+	if args.pixel_scale_arcsec is not None and (not np.isfinite(args.pixel_scale_arcsec) or args.pixel_scale_arcsec <= 0):
+		raise ValueError("--pixel-scale-arcsec must be finite and positive")
 	if args.n_examples <= 0:
 		raise ValueError("--n-examples must be > 0")
 	run_dir = args.run_dir.expanduser().resolve()
@@ -557,6 +570,7 @@ def main() -> None:
 				psf_reconstruction_verbose=args.psf_reconstruction_verbose,
 				obs_panel_n_pix_zero=args.obs_panel_n_pix_zero,
 				dpi=args.dpi,
+				pixel_scale_arcsec=args.pixel_scale_arcsec,
 			)
 		if data_path is not None:
 			_run_data_inference_plots(
@@ -581,6 +595,7 @@ def main() -> None:
 				psf_reconstruction_tv_weight=args.psf_reconstruction_tv_weight,
 				psf_reconstruction_verbose=args.psf_reconstruction_verbose,
 				dpi=args.dpi,
+				pixel_scale_arcsec=args.pixel_scale_arcsec,
 			)
 	print(f"[plot_joint_pinn_fourhead_results] Wrote plots to: {out_dir}")
 

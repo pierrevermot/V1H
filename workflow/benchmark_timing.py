@@ -6,6 +6,8 @@ Usage
         --head-target im --batch-size 64 --n-warmup 5 --n-repeats 50
     python benchmark_timing.py --config <experiment.py> --mode joint \
         --batch-size 64 --n-warmup 5 --n-repeats 50
+    python benchmark_timing.py --config <experiment.py> --run-dir <joint-run> \
+        --mode independent --head-target im --object-source finetuned --batch-size 1
 
 Outputs a single JSON line to stdout with graph-mode latency and throughput statistics.
 """
@@ -13,6 +15,7 @@ Outputs a single JSON line to stdout with graph-mode latency and throughput stat
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -163,12 +166,13 @@ def _build_joint_model(cfg):
 
     psf_unc_config = dict(cfg.PSF_UNC_CONFIG)
     model_name = str(psf_unc_config.get("model_name", "gpkh")).strip().lower()
-    nll = True
     output_activation = str(psf_unc_config.get("output_activation_function", "linear")).strip().lower()
     arch_config = extract_arch_config(psf_unc_config)
 
     psf_unc_input_shape = (input_size, input_size, 2 * n_frames)
-    model_output_shape = (input_size, input_size, n_frames * 2)
+    # Stage 3 predicts only the uncertainty parameter; its mean is supplied by
+    # the frozen PSF-mean head. It does not use the two-output NLL head layout.
+    model_output_shape = (input_size, input_size, n_frames)
 
     builders = {
         "gpkh": build_gpkh,
@@ -184,7 +188,7 @@ def _build_joint_model(cfg):
     psf_unc_model = builder(**kwargs)
     psf_unc_model = _wrap_model_output_activation(
         psf_unc_model, activation_name=output_activation,
-        output_channels=n_frames, nll=nll,
+        output_channels=n_frames, nll=False,
     )
 
     joint_config = dict(cfg.JOINT_PINN_CONFIG)
@@ -211,17 +215,112 @@ def _build_joint_model(cfg):
     return joint_model, input_shape
 
 
-def _benchmark_forward(model, input_shape, batch_size, n_warmup, n_repeats, device, *, jit_compile):
+def _checkpoint_identity(path: Path) -> dict:
+    """Identify the exact saved checkpoint, outside the timed region."""
+    path = path.expanduser().resolve(strict=True)
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return {"path": str(path), "sha256": digest.hexdigest(), "size_bytes": path.stat().st_size}
+
+
+def _load_checkpoint_model(cfg, *, run_dir: Path, mode: str, head_target: str | None,
+                           object_source: str, model_label: str):
+    """Load trained weights; object-only timing runs only the selected head."""
+    import tensorflow as tf
+    from utils.io import _load_joint_run_config
+    from utils.model_io import _load_independent_head_model, _resolve_model_paths
+
+    run_dir = run_dir.expanduser().resolve(strict=True)
+    dataset = dict(cfg.DATASET_LOAD_CONFIG)
+    side = int(cfg.N_PIX) - 2 * int(dataset.get("half_n_pix_crop", 16))
+    input_shape = (side, side, int(cfg.INSTRUMENT_CONFIG.get("n_frames", 1)))
+    if mode == "joint" or object_source == "finetuned":
+        if object_source == "finetuned" and mode == "independent" and head_target != "im":
+            raise ValueError("--object-source finetuned requires --head-target im")
+        from testing.galsim_evaluation import JointPinnBackend
+        backend = JointPinnBackend.from_run(
+            cfg=cfg, run_dir=run_dir, model_label=model_label,
+            preview_obs=tf.zeros((1,) + input_shape, dtype=tf.float32),
+        )
+        model = backend.model if mode == "joint" else backend.model.image_model
+        identity = _checkpoint_identity(backend.model_path)
+        identity["component"] = "full_model" if mode == "joint" else "image_model"
+        description = "joint_pinn_fourhead" if mode == "joint" else "finetuned_object"
+    else:
+        sections = {"im": ("image", "IMAGE_HEAD_CONFIG"),
+                    "noise": ("noise", "NOISE_HEAD_CONFIG"),
+                    "psf": ("psf_mean", "PSF_HEAD_CONFIG")}
+        if head_target not in sections:
+            raise ValueError("--head-target is required for --mode independent")
+        source_key, config_key = sections[head_target]
+        training_cfg = _load_joint_run_config(run_dir)
+        source = dict(training_cfg.get("source_models", {}).get(source_key, {}))
+        recorded = str(source.get("model_path", "")).strip()
+        checkpoint = Path(recorded).expanduser() if recorded else None
+        if checkpoint is None or not checkpoint.is_file():
+            head_dir = run_dir.parent / str(getattr(cfg, config_key)["run_name"])
+            checkpoint = _resolve_model_paths(head_dir)[model_label]
+        out_channels = 1 if head_target == "im" else input_shape[-1]
+        model, _ = _load_independent_head_model(
+            checkpoint, fallback_input_shape=input_shape,
+            fallback_output_shape=(side, side, out_channels),
+        )
+        identity = _checkpoint_identity(checkpoint)
+        identity["component"] = source_key
+        description = f"pretrained_{head_target}"
+    shape = getattr(model, "input_shape", None)
+    if shape is not None and len(shape) == 4 and all(v is not None for v in shape[1:]):
+        input_shape = tuple(int(v) for v in shape[1:])
+    return model, input_shape, description, identity
+
+
+def _latency_statistics(latencies_s, batch_size: int) -> dict:
+    """Keep batch latency separate from amortized time and throughput."""
+    values = np.asarray(latencies_s, dtype=float)
+    if values.ndim != 1 or not len(values) or not np.all(np.isfinite(values)) or np.any(values <= 0):
+        raise ValueError("Timings must be a nonempty vector of finite positive values")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    throughput_sps = batch_size / values
+    return {
+        "latency": {
+            "batch_mean_s": float(np.mean(values)),
+            "batch_std_s": float(np.std(values)),
+            "batch_median_s": float(np.median(values)),
+            "batch_min_s": float(np.min(values)),
+            "batch_max_s": float(np.max(values)),
+            "batch_times_s": values.tolist(),
+        },
+        "throughput": {
+            "samples_per_second_mean": float(np.mean(throughput_sps)),
+            "samples_per_second_std": float(np.std(throughput_sps)),
+            "samples_per_second_median": float(np.median(throughput_sps)),
+            "samples_per_second_min": float(np.min(throughput_sps)),
+            "samples_per_second_max": float(np.max(throughput_sps)),
+            "per_sample_mean_ms": float(np.mean(values) / batch_size * 1000),
+            "per_sample_median_ms": float(np.median(values) / batch_size * 1000),
+        },
+        "single_image_latency_ms": float(np.mean(values) * 1000) if batch_size == 1 else None,
+        "amortized_time_per_image_ms": float(np.mean(values) / batch_size * 1000),
+    }
+
+
+def _benchmark_forward(model, input_shape, batch_size, n_warmup, n_repeats, device, *, jit_compile,
+                       include_transfers: bool = False):
     """Run graph-mode forward passes and measure latency and throughput."""
     import tensorflow as tf
 
     compute_dtype = tf.dtypes.as_dtype(getattr(model, "compute_dtype", None) or tf.keras.mixed_precision.global_policy().compute_dtype)
-    dummy = tf.random.normal((batch_size,) + input_shape, dtype=compute_dtype)
-
     if device == "cpu":
         target_device = "/CPU:0"
     else:
         target_device = "/GPU:0"
+
+    host_dummy = np.random.default_rng(1234).normal(size=(batch_size,) + input_shape).astype(compute_dtype.as_numpy_dtype)
+    with tf.device(target_device):
+        dummy = tf.convert_to_tensor(host_dummy, dtype=compute_dtype)
 
     effective_n_warmup = n_warmup + 3
 
@@ -233,6 +332,14 @@ def _benchmark_forward(model, input_shape, batch_size, n_warmup, n_repeats, devi
         if device != "cpu":
             tf.test.experimental.sync_devices()
 
+    def run_once():
+        batch = tf.convert_to_tensor(host_dummy, dtype=compute_dtype) if include_transfers else dummy
+        result = compiled_inference(batch)
+        if include_transfers:
+            # Materialize every returned tensor on the host, including uncertainty.
+            tf.nest.map_structure(lambda value: value.numpy(), result)
+        sync_if_needed()
+
     # Build and compile the graph before warmup so trace/compile time is excluded.
     with tf.device(target_device):
         compile_start = time.perf_counter()
@@ -243,22 +350,17 @@ def _benchmark_forward(model, input_shape, batch_size, n_warmup, n_repeats, devi
     # Warm-up
     with tf.device(target_device):
         for _ in range(effective_n_warmup):
-            _ = compiled_inference(dummy)
-            sync_if_needed()
+            run_once()
 
-    # Timed runs with explicit device synchronization on GPU so this measures
-    # strict end-to-end call latency rather than optimistic async dispatch.
+    # Synchronize every call; inference timing excludes the separately measured
+    # transfer path, preprocessing, file I/O, tracing, and model loading.
     latencies_s = []
     with tf.device(target_device):
         for _ in range(n_repeats):
             t0 = time.perf_counter()
-            _ = compiled_inference(dummy)
-            sync_if_needed()
+            run_once()
             t1 = time.perf_counter()
             latencies_s.append(t1 - t0)
-
-    latencies_s = np.array(latencies_s)
-    throughput_sps = batch_size / latencies_s
 
     return {
         "execution_mode": "graph",
@@ -266,33 +368,21 @@ def _benchmark_forward(model, input_shape, batch_size, n_warmup, n_repeats, devi
         "requested_warmup_calls": int(n_warmup),
         "effective_warmup_calls": int(effective_n_warmup),
         "first_compiled_call_s": float(compile_end - compile_start),
+        "scope": "input_transfer_network_output_transfer" if include_transfers else "network_only",
+        "includes_host_device_transfers": bool(include_transfers),
+        "includes_preprocessing": False,
+        "preprocessing_note": "Inputs are already cropped and normalized; image decoding and scientific preprocessing are excluded.",
         "synchronization_mode": (
-            "strict_end_to_end_device_sync"
+            "device_sync"
             if device != "cpu"
             else "host_blocking"
         ),
         "synchronization_note": (
-            "GPU timing includes explicit device synchronization after every call, so it measures strict end-to-end latency rather than optimistic asynchronous dispatch."
+            "GPU execution is synchronized after every call. Host/device transfers are included only in the separately requested transfer benchmark."
             if device != "cpu"
-            else "CPU timing is host-blocking and measures strict end-to-end latency per call."
+            else "CPU execution is host-blocking; preprocessing is excluded."
         ),
-        "latency": {
-            "batch_mean_s": float(np.mean(latencies_s)),
-            "batch_std_s": float(np.std(latencies_s)),
-            "batch_median_s": float(np.median(latencies_s)),
-            "batch_min_s": float(np.min(latencies_s)),
-            "batch_max_s": float(np.max(latencies_s)),
-            "batch_times_s": latencies_s.tolist(),
-        },
-        "throughput": {
-            "samples_per_second_mean": float(np.mean(throughput_sps)),
-            "samples_per_second_std": float(np.std(throughput_sps)),
-            "samples_per_second_median": float(np.median(throughput_sps)),
-            "samples_per_second_min": float(np.min(throughput_sps)),
-            "samples_per_second_max": float(np.max(throughput_sps)),
-            "per_sample_mean_ms": float(np.mean(latencies_s) / batch_size * 1000),
-            "per_sample_median_ms": float(np.median(latencies_s) / batch_size * 1000),
-        },
+        **_latency_statistics(latencies_s, batch_size),
     }
 
 
@@ -303,6 +393,13 @@ def _parse_args() -> argparse.Namespace:
                         help="Benchmark independent heads or the joint model")
     parser.add_argument("--head-target", choices=["im", "psf", "noise"], default=None,
                         help="Head target (required for --mode independent)")
+    parser.add_argument("--run-dir", type=Path, default=None,
+                        help="Joint run directory: load actual checkpoints rather than random architecture weights")
+    parser.add_argument("--model-label", choices=["best_model", "final_model"], default="best_model")
+    parser.add_argument("--object-source", choices=["pretrained", "finetuned"], default="pretrained",
+                        help="For object-only timing, select the independent or fine-tuned object head")
+    parser.add_argument("--end-to-end", action="store_true",
+                        help="Also measure input/output transfers; excludes image decoding, cropping and normalization")
     parser.add_argument("--batch-size", type=int, required=True, help="Batch size for inference")
     parser.add_argument("--n-warmup", type=int, default=5, help="Number of warmup forward passes")
     parser.add_argument("--n-repeats", type=int, default=50, help="Number of timed forward passes")
@@ -319,6 +416,10 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if args.batch_size <= 0 or args.n_repeats <= 0 or args.n_warmup < 0:
+        raise ValueError("Batch size and repeats must be positive; warmup must be nonnegative")
+    if args.object_source == "finetuned" and args.run_dir is None:
+        raise ValueError("--object-source finetuned requires --run-dir")
 
     import tensorflow as tf
 
@@ -345,7 +446,13 @@ def main() -> None:
     from configs.load_config import load_experiment_config
     cfg = load_experiment_config(args.config)
 
-    if args.mode == "independent":
+    checkpoint = None
+    if args.run_dir is not None:
+        model, input_shape, model_desc, checkpoint = _load_checkpoint_model(
+            cfg, run_dir=args.run_dir, mode=args.mode, head_target=args.head_target,
+            object_source=args.object_source, model_label=args.model_label,
+        )
+    elif args.mode == "independent":
         if args.head_target is None:
             print("ERROR: --head-target is required for --mode independent", file=sys.stderr)
             sys.exit(1)
@@ -371,6 +478,9 @@ def main() -> None:
         "mode": args.mode,
         "head_target": args.head_target,
         "model": model_desc,
+        "weights": "checkpoint" if checkpoint is not None else "random_architecture",
+        "checkpoint": checkpoint,
+        "object_source": args.object_source if args.mode == "independent" and args.head_target == "im" else None,
         "batch_size": args.batch_size,
         "n_warmup": args.n_warmup,
         "n_repeats": args.n_repeats,
@@ -379,11 +489,17 @@ def main() -> None:
         "dtype": args.dtype,
         "mixed_precision": args.mixed_precision,
         "precision": precision_config,
+        "model_compute_dtype": str(getattr(model, "compute_dtype", "unknown")),
         "n_params": n_params,
         "input_shape": list(input_shape),
         "device_info": device_info,
         "timing": timing,
     }
+    if args.end_to_end:
+        result["timing_with_transfers"] = _benchmark_forward(
+            model, input_shape, args.batch_size, args.n_warmup, args.n_repeats,
+            effective_device, jit_compile=args.jit_compile, include_transfers=True,
+        )
     # Output JSON to stdout (one line)
     print(json.dumps(result))
 

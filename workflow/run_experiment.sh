@@ -6,6 +6,8 @@
 #   ./run_experiment.sh <config.py> [--gpu v100|h100] [--dry-run]
 #       [--skip-step1] [--skip-step2a] [--skip-step2b] [--skip-step2c]
 #       [--skip-step3] [--skip-step4] [--skip-step5]
+#       [--archive-store <STORE directory>]
+#       [--dataset-job <existing producer job ID>] (with --skip-step1)
 #
 # Steps (with SLURM job dependencies):
 #   1. Create TFRecord dataset            (CPU)
@@ -16,7 +18,10 @@
 #   3. PSF uncertainty stage 2             (GPU, depends on 2c)
 #   4. Joint PINN four-head fine-tuning    (GPU, depends on 2a+2b+3)
 #   5. Plot results                        (CPU, depends on 4)
+#   6. Archive run, excluding dataset/     (archive, waits for all jobs)
 # ===========================================================================
+set -eo pipefail
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
@@ -34,11 +39,15 @@ SKIP_STEP3=false
 SKIP_STEP4=false
 SKIP_STEP5=false
 CPU_MODULE_TF="tensorflow-gpu/py3/2.16.1"
+ARCHIVE_STORE=""
+DATASET_JOB=""
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--gpu)    GPU_TYPE="$2"; shift 2 ;;
 		--dry-run) DRY_RUN=true; shift ;;
+		--archive-store) ARCHIVE_STORE="${2:?--archive-store requires a directory}"; shift 2 ;;
+		--dataset-job) DATASET_JOB="${2:?--dataset-job requires a job ID}"; shift 2 ;;
 		--skip-step1) SKIP_STEP1=true; shift ;;
 		--skip-step2a) SKIP_STEP2A=true; shift ;;
 		--skip-step2b) SKIP_STEP2B=true; shift ;;
@@ -52,10 +61,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$CONFIG" ]]; then
-	echo "Usage: $0 <config.py> [--gpu v100|h100] [--dry-run] [--skip-step1] [--skip-step2a] [--skip-step2b] [--skip-step2c] [--skip-step3] [--skip-step4] [--skip-step5]" >&2
+	echo "Usage: $0 <config.py> [--gpu v100|h100] [--dry-run] [--skip-step1] [--skip-step2a] [--skip-step2b] [--skip-step2c] [--skip-step3] [--skip-step4] [--skip-step5] [--archive-store <directory>]" >&2
 	exit 1
 fi
 CONFIG="$(realpath "$CONFIG")"
+if [[ -n "$DATASET_JOB" ]]; then
+	$SKIP_STEP1 && [[ "$DATASET_JOB" =~ ^[0-9]+$ ]] || { echo "--dataset-job requires --skip-step1 and a numeric job ID" >&2; exit 1; }
+fi
 
 if [[ ! -f "$CONFIG" ]]; then
 	echo "Config file not found: $CONFIG" >&2
@@ -110,6 +122,7 @@ case "$GPU_TYPE" in
 		GPU_CONSTRAINT=""
 		ARCH_PREMODULE=""
 		MODULE_TF="tensorflow-gpu/py3/2.16.1"
+		GPU_PARTITION="gpu_p13"
 		;;
 	h100)
 		SLURM_GPU_ACCOUNT="$SLURM_GPU_ACCOUNT_H100"
@@ -117,6 +130,7 @@ case "$GPU_TYPE" in
 		GPU_CONSTRAINT="#SBATCH -C h100"
 		ARCH_PREMODULE="module load arch/h100"
 		MODULE_TF="tensorflow-gpu/py3/2.17.0"
+		GPU_PARTITION="gpu_p6"
 		;;
 	*)
 		echo "Unknown GPU type: $GPU_TYPE (must be v100 or h100)" >&2
@@ -126,6 +140,14 @@ esac
 
 LOG_DIR="$OUTPUT_BASE_DIR/slurm_logs"
 mkdir -p "$LOG_DIR"
+if [[ -n "$ARCHIVE_STORE" ]]; then
+	ARCHIVE_STORE="$(realpath -m "$ARCHIVE_STORE")"
+	case "$ARCHIVE_STORE/" in
+		"$(realpath -m "$OUTPUT_BASE_DIR")/"*)
+			echo "Archive destination must be outside the run directory" >&2
+			exit 1 ;;
+	esac
+fi
 
 echo "=========================================="
 echo "Experiment config : $CONFIG"
@@ -141,6 +163,7 @@ echo "Skip step 2c      : $SKIP_STEP2C"
 echo "Skip step 3       : $SKIP_STEP3"
 echo "Skip step 4       : $SKIP_STEP4"
 echo "Skip step 5       : $SKIP_STEP5"
+echo "Archive STORE     : ${ARCHIVE_STORE:-disabled}"
 echo "=========================================="
 
 # ---------------------------------------------------------------------------
@@ -178,10 +201,23 @@ join_dependency_opt() {
 submit_job() {
 	local job_script="$1"
 	if $DRY_RUN; then
-		echo "[DRY-RUN] Would submit: $job_script"
+		echo "[DRY-RUN] Would submit: $job_script" >&2
 		echo "DRY_RUN_JOB_$(basename "$job_script" .sh)"
 	else
-		sbatch "$job_script" | awk '{print $NF}'
+		local submitted
+		submitted=$(sbatch --parsable "$job_script") || return $?
+		submitted="${submitted%%;*}"
+		[[ "$submitted" =~ ^[0-9]+$ ]] || { echo "Invalid sbatch response: $submitted" >&2; return 1; }
+		python3 - "$LOG_DIR/submissions.jsonl" "$submitted" "$job_script" <<'PY'
+import json
+import os
+import sys
+with open(sys.argv[1], 'a') as handle:
+    handle.write(json.dumps(dict(job_id=sys.argv[2], script=sys.argv[3])) + '\n')
+    handle.flush()
+    os.fsync(handle.fileno())
+PY
+		printf '%s\n' "$submitted"
 	fi
 }
 
@@ -189,9 +225,9 @@ submit_job() {
 # Step 1: Create dataset (CPU array job)
 # ===========================================================================
 if $SKIP_STEP1; then
-	JOB1="SKIPPED"
+	JOB1="${DATASET_JOB:-SKIPPED}"
 	echo "Step 1 (create dataset)      : skipped"
-	STEP1_DEPENDENCY_OPT=""
+	STEP1_DEPENDENCY_OPT=$(join_dependency_opt "$JOB1")
 else
 	STEP1_SCRIPT="$LOG_DIR/step1_create_dataset.sh"
 	cat > "$STEP1_SCRIPT" <<SLURM_EOF
@@ -200,12 +236,14 @@ else
 #SBATCH --output=$LOG_DIR/step1_%A_%a.out
 #SBATCH --error=$LOG_DIR/step1_%A_%a.err
 #SBATCH --account=$SLURM_CPU_ACCOUNT
+#SBATCH --partition=cpu_p1
 #SBATCH --cpus-per-task=$DATASET_CPUS
 #SBATCH --time=$DATASET_TIME
 #SBATCH --array=0-$((DATASET_N_ARRAY - 1))
 #SBATCH --hint=nomultithread
 $EXCLUDE_OPT
 
+set -eo pipefail
 module purge
 module load $CPU_MODULE_TF
 export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
@@ -278,6 +316,7 @@ else
 #SBATCH --output=$LOG_DIR/step2a_%j.out
 #SBATCH --error=$LOG_DIR/step2a_%j.err
 #SBATCH --account=$SLURM_GPU_ACCOUNT
+#SBATCH --partition=$GPU_PARTITION
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=$SLURM_CPUS
@@ -285,8 +324,10 @@ else
 #SBATCH --hint=nomultithread
 $GPU_CONSTRAINT
 $STEP1_DEPENDENCY_OPT
+#SBATCH --kill-on-invalid-dep=yes
 $EXCLUDE_OPT
 
+set -eo pipefail
 module purge
 $ARCH_PREMODULE
 module load $MODULE_TF
@@ -315,6 +356,7 @@ else
 #SBATCH --output=$LOG_DIR/step2b_%j.out
 #SBATCH --error=$LOG_DIR/step2b_%j.err
 #SBATCH --account=$SLURM_GPU_ACCOUNT
+#SBATCH --partition=$GPU_PARTITION
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=$SLURM_CPUS
@@ -322,8 +364,10 @@ else
 #SBATCH --hint=nomultithread
 $GPU_CONSTRAINT
 $STEP1_DEPENDENCY_OPT
+#SBATCH --kill-on-invalid-dep=yes
 $EXCLUDE_OPT
 
+set -eo pipefail
 module purge
 $ARCH_PREMODULE
 module load $MODULE_TF
@@ -352,6 +396,7 @@ else
 #SBATCH --output=$LOG_DIR/step2c_%j.out
 #SBATCH --error=$LOG_DIR/step2c_%j.err
 #SBATCH --account=$SLURM_GPU_ACCOUNT
+#SBATCH --partition=$GPU_PARTITION
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=$SLURM_CPUS
@@ -359,8 +404,10 @@ else
 #SBATCH --hint=nomultithread
 $GPU_CONSTRAINT
 $STEP1_DEPENDENCY_OPT
+#SBATCH --kill-on-invalid-dep=yes
 $EXCLUDE_OPT
 
+set -eo pipefail
 module purge
 $ARCH_PREMODULE
 module load $MODULE_TF
@@ -391,6 +438,7 @@ else
 #SBATCH --output=$LOG_DIR/step3_%j.out
 #SBATCH --error=$LOG_DIR/step3_%j.err
 #SBATCH --account=$SLURM_GPU_ACCOUNT
+#SBATCH --partition=$GPU_PARTITION
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=$SLURM_CPUS
@@ -398,8 +446,10 @@ else
 #SBATCH --hint=nomultithread
 $GPU_CONSTRAINT
 $STEP3_DEPENDENCY_OPT
+#SBATCH --kill-on-invalid-dep=yes
 $EXCLUDE_OPT
 
+set -eo pipefail
 module purge
 $ARCH_PREMODULE
 module load $MODULE_TF
@@ -430,6 +480,7 @@ else
 #SBATCH --output=$LOG_DIR/step4_%j.out
 #SBATCH --error=$LOG_DIR/step4_%j.err
 #SBATCH --account=$SLURM_GPU_ACCOUNT
+#SBATCH --partition=$GPU_PARTITION
 #SBATCH --qos=$QOS
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=$SLURM_CPUS
@@ -437,8 +488,10 @@ else
 #SBATCH --hint=nomultithread
 $GPU_CONSTRAINT
 $STEP4_DEPENDENCY_OPT
+#SBATCH --kill-on-invalid-dep=yes
 $EXCLUDE_OPT
 
+set -eo pipefail
 module purge
 $ARCH_PREMODULE
 module load $MODULE_TF
@@ -469,12 +522,15 @@ else
 #SBATCH --output=$LOG_DIR/step5_%j.out
 #SBATCH --error=$LOG_DIR/step5_%j.err
 #SBATCH --account=$SLURM_CPU_ACCOUNT
+#SBATCH --partition=cpu_p1
 #SBATCH --cpus-per-task=4
 #SBATCH --time=01:00:00
 #SBATCH --hint=nomultithread
 $STEP5_DEPENDENCY_OPT
+#SBATCH --kill-on-invalid-dep=yes
 $EXCLUDE_OPT
 
+set -eo pipefail
 module purge
 module load $CPU_MODULE_TF
 export PYTHONPATH="$ROOT_DIR":"${PYTHONPATH:-}"
@@ -494,6 +550,48 @@ SLURM_EOF
 	JOB5=$(submit_job "$STEP5_SCRIPT")
 	echo "Step 5 (plot results)        : JobID=$JOB5"
 fi
+
+# Archive after every submitted writer has terminated. Failed dependency chains
+# are cancelled above, allowing partial results and diagnostics to be archived.
+JOB6="DISABLED"
+if [[ -n "$ARCHIVE_STORE" ]]; then
+	ARCHIVE_DEPENDENCY=$(join_dependency_opt "$JOB1" "$JOB2A" "$JOB2B" "$JOB2C" "$JOB3" "$JOB4" "$JOB5")
+	ARCHIVE_DEPENDENCY="${ARCHIVE_DEPENDENCY/afterok:/afterany:}"
+	STEP6_SCRIPT="$LOG_DIR/step6_archive.sh"
+	cat > "$STEP6_SCRIPT" <<SLURM_EOF
+#!/usr/bin/env bash
+#SBATCH --job-name=archive_v1h
+#SBATCH --output=$LOG_DIR/step6_%j.out
+#SBATCH --error=$LOG_DIR/step6_%j.err
+#SBATCH --account=$SLURM_CPU_ACCOUNT
+#SBATCH --partition=archive
+#SBATCH --qos=qos_cpu-t3
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --time=20:00:00
+#SBATCH --hint=nomultithread
+$ARCHIVE_DEPENDENCY
+
+set -eo pipefail
+python3 "$SCRIPT_DIR/archive_run.py" \\
+	--run-dir "$OUTPUT_BASE_DIR" --store "$ARCHIVE_STORE"
+SLURM_EOF
+	chmod +x "$STEP6_SCRIPT"
+	JOB6=$(submit_job "$STEP6_SCRIPT")
+	echo "Step 6 (STORE archive)       : JobID=$JOB6"
+fi
+
+# Keep submission IDs beside the scientific outputs, including dry-run plans.
+python3 - "$OUTPUT_BASE_DIR" "$DRY_RUN" "$JOB1" "$JOB2A" "$JOB2B" "$JOB2C" "$JOB3" "$JOB4" "$JOB5" "$JOB6" <<'PY'
+import json
+from pathlib import Path
+import sys
+root, dry_run, *identifiers = sys.argv[1:]
+names = ('dataset', 'image', 'noise', 'psf_mean', 'psf_uncertainty', 'joint', 'plots', 'archive')
+filename = 'jobs_dry_run.json' if dry_run == 'true' else 'jobs.json'
+Path(root, filename).write_text(json.dumps(dict(zip(names, identifiers)), indent=2) + '\n')
+PY
 
 echo ""
 echo "=========================================="
@@ -525,5 +623,8 @@ else
 	else
 		echo "  Step 4 ($JOB4) -> Step 5 ($JOB5)"
 	fi
+fi
+if [[ -n "$ARCHIVE_STORE" ]]; then
+	echo "  All submitted jobs -> Step 6 ($JOB6): $ARCHIVE_STORE/$(basename "$OUTPUT_BASE_DIR").tar"
 fi
 echo "=========================================="

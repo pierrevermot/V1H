@@ -632,6 +632,8 @@ def main() -> None:
 	global _TEMP_ROOT
 	args = _parse_args()
 	cfg = load_experiment_config(args.config)
+	if getattr(cfg, "TRAINING_SEED", None) is not None:
+		tf.keras.utils.set_random_seed(int(cfg.TRAINING_SEED))
 
 	psf_unc_config = dict(cfg.PSF_UNC_CONFIG)
 	psf_head_config = dict(cfg.PSF_HEAD_CONFIG)

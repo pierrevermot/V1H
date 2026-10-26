@@ -157,6 +157,7 @@ def make_dataset(
 	norm_psf: str | float | None = "npix2",
 	norm_noise: str | float | None = "npix2",
 	num_parallel_calls: int | None = None,
+	num_parallel_reads: int | None = None,
 	prefetch: bool = True,
 ) -> tf.data.Dataset:
 	"""Create a tf.data.Dataset for training.
@@ -179,6 +180,8 @@ def make_dataset(
 		Crop this many pixels from each side. Default 12.
 	num_parallel_calls : int or None, optional
 		Parallelism for map. Default AUTOTUNE.
+	num_parallel_reads : int or None, optional
+		TFRecord read parallelism; use 1 for a stable cross-job record order.
 	prefetch : bool, optional
 		Whether to prefetch. Default True.
 	"""
@@ -186,7 +189,8 @@ def make_dataset(
 	if num_parallel_calls is None:
 		num_parallel_calls = tf.data.AUTOTUNE
 
-	ds = tf.data.TFRecordDataset(files, num_parallel_reads=tf.data.AUTOTUNE)
+	reads = tf.data.AUTOTUNE if num_parallel_reads is None else int(num_parallel_reads)
+	ds = tf.data.TFRecordDataset(files, num_parallel_reads=reads)
 	ds = ds.map(_parse_example, num_parallel_calls=num_parallel_calls)
 	ds = ds.map(
 		lambda feats: _prepare_example(
